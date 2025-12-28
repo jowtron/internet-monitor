@@ -1,0 +1,23 @@
+# NAS Internet Monitor Configuration
+
+# Ping targets - multiple targets for redundancy
+# Uses the first successful response
+ping_targets:
+  - "1.1.1.1"      # Cloudflare DNS
+  - "8.8.8.8"      # Google DNS
+  - "9.9.9.9"      # Quad9 DNS
+
+# Ping settings
+ping_interval_seconds: 30    # How often to check connectivity
+ping_timeout_seconds: 5      # Timeout for each ping
+ping_count: 3                # Number of pings per check
+
+# VPS communication (over Tailscale)
+vps_url: "http://YOUR_VPS_TAILSCALE_IP:5000"  # Your VPS Tailscale IP
+heartbeat_interval_seconds: 60     # How often to send heartbeats
+
+# Logging
+log_directory: "./logs"  # Where to store CSV logs
+
+# Optional: Direct ntfy notifications from NAS (usually handled by VPS)
+# ntfy_topic: ""

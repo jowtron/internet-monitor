@@ -1,0 +1,20 @@
+services:
+  vps-monitor:
+    build: .
+    image: ghcr.io/jowtron/internet-monitor/vps-monitor:latest
+    container_name: vps-monitor
+    restart: unless-stopped
+    environment:
+      # Required: Set your ntfy topic
+      - NTFY_TOPIC=your-ntfy-topic
+      # Optional overrides
+      - NTFY_SERVER_URL=https://ntfy.sh
+      - HEARTBEAT_TIMEOUT=180
+      - STARTUP_GRACE=120
+    volumes:
+      # Persist outage log
+      - ./data:/app/data
+    ports:
+      - "5000:5000"
+    # Or use host network for Tailscale access:
+    # network_mode: host

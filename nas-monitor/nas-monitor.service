@@ -1,0 +1,35 @@
+[Unit]
+Description=NAS Internet Monitor
+After=network-online.target tailscaled.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/nas-monitor
+ExecStart=/opt/nas-monitor/venv/bin/python /opt/nas-monitor/monitor.py
+Restart=always
+RestartSec=10
+
+# Environment
+Environment=CONFIG_PATH=/opt/nas-monitor/config.yaml
+# Uncomment and set these to override config.yaml
+#Environment=VPS_URL=http://100.64.0.1:5000
+#Environment=LOG_DIRECTORY=/var/log/nas-monitor
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nas-monitor
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/nas-monitor/logs /var/log/nas-monitor
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

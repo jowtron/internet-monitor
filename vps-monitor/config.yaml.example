@@ -1,0 +1,20 @@
+# VPS Internet Monitor Configuration
+
+# HTTP server settings
+listen_host: "0.0.0.0"  # Listen on all interfaces (Tailscale will be one of them)
+listen_port: 5000
+
+# Heartbeat monitoring
+heartbeat_timeout_seconds: 180  # 3 minutes - trigger DOWN after this long without heartbeat
+check_interval_seconds: 30      # How often to check for missed heartbeats
+
+# Startup grace period - don't send DOWN notification for this long after startup
+# Allows time for NAS to send initial heartbeat
+startup_grace_seconds: 120
+
+# ntfy notification settings
+ntfy_server_url: "https://ntfy.sh"
+ntfy_topic: ""  # Set this to your ntfy topic (or use NTFY_TOPIC env var)
+
+# Outage logging
+outage_log_file: "./outages.log"
