@@ -64,42 +64,7 @@ vps-monitor/
   vps-monitor.service # Systemd unit
 ```
 
-## Production Deployment
-
-### NAS (QNAP TS-453be at 100.66.41.139)
-- **Deployment**: Docker container
-- **Docker path**: `/share/CACHEDEV3_DATA/.qpkg/container-station/usr/bin/docker`
-- **Logs**: `/share/Container/nas-monitor/logs/`
-- **Container name**: `nas-monitor`
-
-```bash
-# SSH access
-ssh admin@100.66.41.139
-
-# Docker commands (use full path)
-DOCKER=/share/CACHEDEV3_DATA/.qpkg/container-station/usr/bin/docker
-$DOCKER logs nas-monitor -f
-$DOCKER restart nas-monitor
-$DOCKER ps --filter name=nas-monitor
-```
-
-### VPS (Debian at 100.89.202.1)
-- **Deployment**: Bare metal with systemd
-- **Install path**: `/opt/internet-monitor/vps-monitor/`
-- **Config**: `/opt/internet-monitor/vps-monitor/config.yaml`
-- **ntfy topic**: `jowtron-home-network`
-
-```bash
-# SSH access
-ssh root@100.89.202.1
-
-# Service commands
-systemctl status vps-monitor
-journalctl -u vps-monitor -f
-curl http://localhost:5000/status
-```
-
-## Systemd Notes
+## Deployment Notes
 
 Both services use systemd with:
 - `After=tailscaled.service` dependency

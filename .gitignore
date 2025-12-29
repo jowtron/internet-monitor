@@ -33,3 +33,6 @@ Thumbs.db
 
 # Docker
 data/
+
+# Private deployment info
+DEPLOYMENT.md
