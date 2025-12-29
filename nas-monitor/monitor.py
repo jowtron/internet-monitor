@@ -2,12 +2,12 @@
 """
 NAS Internet Monitor
 
-Monitors internet connectivity by pinging multiple targets, logs results to CSV,
-and sends heartbeats to a VPS monitor over Tailscale. When outages are detected,
-accumulated data is sent to the VPS upon reconnection.
+Monitors internet connectivity by pinging multiple targets, logs events to CSV,
+runs speed tests when triggered, and sends heartbeats to a VPS monitor over Tailscale.
 """
 
 import csv
+import io
 import logging
 import os
 import signal
@@ -17,6 +17,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from queue import Queue, Empty
 from typing import Optional
@@ -44,7 +45,14 @@ class Config:
     vps_url: str = 'http://100.64.0.1:5000'  # Tailscale IP
     log_directory: str = './logs'
     log_retention_days: int = 365  # Keep logs for 1 year
-    ntfy_topic: str = ''  # Optional direct ntfy notifications from NAS
+    ntfy_server_url: str = 'https://ntfy.sh'
+    ntfy_topic: str = ''  # For speed test notifications
+    # Thresholds
+    high_latency_threshold_ms: int = 200  # Trigger speed test above this
+    slow_speed_threshold_mbps: float = 50.0  # Trigger frequent tests below this
+    slow_speed_test_interval_seconds: int = 300  # 5 min when speed is slow
+    # HTTP server for manual triggers
+    http_port: int = 8080
 
     @classmethod
     def load(cls, config_path: str = 'config.yaml') -> 'Config':
@@ -68,7 +76,11 @@ class Config:
             'VPS_URL': ('vps_url', str),
             'LOG_DIRECTORY': ('log_directory', str),
             'LOG_RETENTION_DAYS': ('log_retention_days', int),
+            'NTFY_SERVER_URL': ('ntfy_server_url', str),
             'NTFY_TOPIC': ('ntfy_topic', str),
+            'HIGH_LATENCY_THRESHOLD': ('high_latency_threshold_ms', int),
+            'SLOW_SPEED_THRESHOLD': ('slow_speed_threshold_mbps', float),
+            'HTTP_PORT': ('http_port', int),
         }
 
         for env_var, (attr, converter) in env_mappings.items():
@@ -93,6 +105,17 @@ class PingResult:
 
 
 @dataclass
+class SpeedTestResult:
+    """Result of a speed test."""
+    timestamp: float
+    datetime_str: str
+    speed_mbps: float
+    duration_seconds: float
+    file_size_bytes: int
+    trigger: str  # 'manual', 'post_outage', 'high_latency', 'slow_speed_retest'
+
+
+@dataclass
 class OutageEvent:
     """Represents a detected outage."""
     start_time: float
@@ -109,12 +132,8 @@ class PingMonitor:
         self.config = config
 
     def ping(self, target: str) -> tuple[bool, Optional[float]]:
-        """
-        Ping a target and return (success, latency_ms).
-        Uses subprocess for cross-platform compatibility.
-        """
+        """Ping a target and return (success, latency_ms)."""
         try:
-            # Determine ping command based on platform
             if sys.platform == 'darwin':  # macOS
                 cmd = ['ping', '-c', str(self.config.ping_count), '-t',
                        str(self.config.ping_timeout_seconds), target]
@@ -126,20 +145,16 @@ class PingMonitor:
                        str(self.config.ping_timeout_seconds), target]
 
             result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
+                cmd, capture_output=True, text=True,
                 timeout=self.config.ping_timeout_seconds * self.config.ping_count + 5
             )
 
             if result.returncode == 0:
-                # Parse average latency from output
                 latency = self._parse_ping_latency(result.stdout)
                 return True, latency
             return False, None
 
         except subprocess.TimeoutExpired:
-            logger.debug(f"Ping to {target} timed out")
             return False, None
         except Exception as e:
             logger.error(f"Ping error for {target}: {e}")
@@ -148,27 +163,19 @@ class PingMonitor:
     def _parse_ping_latency(self, output: str) -> Optional[float]:
         """Extract average latency from ping output."""
         try:
-            # macOS/Linux format: "round-trip min/avg/max/stddev = 1.234/5.678/9.012/1.234 ms"
-            # or "rtt min/avg/max/mdev = 1.234/5.678/9.012/1.234 ms"
             for line in output.split('\n'):
                 if 'avg' in line.lower() or 'average' in line.lower():
-                    # Find the numbers part
                     if '=' in line:
                         numbers_part = line.split('=')[1].strip()
-                        # Split by '/' and get the average (second value)
                         parts = numbers_part.split('/')
                         if len(parts) >= 2:
                             return float(parts[1])
             return None
-        except (ValueError, IndexError) as e:
-            logger.debug(f"Could not parse ping latency: {e}")
+        except (ValueError, IndexError):
             return None
 
     def check_connectivity(self) -> PingResult:
-        """
-        Check internet connectivity by pinging all targets.
-        Returns online if ANY target responds.
-        """
+        """Check internet connectivity by pinging targets."""
         timestamp = time.time()
         datetime_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         best_latency = None
@@ -183,7 +190,7 @@ class PingMonitor:
                 if latency is not None:
                     if best_latency is None or latency < best_latency:
                         best_latency = latency
-                break  # Stop on first success for efficiency
+                break
 
         return PingResult(
             timestamp=timestamp,
@@ -194,8 +201,59 @@ class PingMonitor:
         )
 
 
-class CSVLogger:
-    """Handles CSV logging of ping results."""
+class SpeedTester:
+    """Handles speed tests by downloading file from VPS."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.session = requests.Session()
+
+    def run_test(self, trigger: str = 'manual') -> Optional[SpeedTestResult]:
+        """Run a speed test by downloading file from VPS."""
+        url = f"{self.config.vps_url}/speedtest"
+        timestamp = time.time()
+        datetime_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        try:
+            start_time = time.time()
+            response = self.session.get(url, timeout=60, stream=True)
+
+            if response.status_code != 200:
+                logger.error(f"Speed test failed: HTTP {response.status_code}")
+                return None
+
+            # Download and measure
+            total_bytes = 0
+            for chunk in response.iter_content(chunk_size=8192):
+                total_bytes += len(chunk)
+
+            end_time = time.time()
+            duration = end_time - start_time
+
+            if duration > 0:
+                speed_mbps = (total_bytes * 8) / (duration * 1_000_000)
+            else:
+                speed_mbps = 0
+
+            result = SpeedTestResult(
+                timestamp=timestamp,
+                datetime_str=datetime_str,
+                speed_mbps=speed_mbps,
+                duration_seconds=duration,
+                file_size_bytes=total_bytes,
+                trigger=trigger
+            )
+
+            logger.info(f"Speed test: {speed_mbps:.1f} Mbps ({trigger})")
+            return result
+
+        except requests.RequestException as e:
+            logger.error(f"Speed test failed: {e}")
+            return None
+
+
+class EventLogger:
+    """Logs events (status changes, speed tests, anomalies) to CSV."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -212,28 +270,23 @@ class CSVLogger:
             raise
 
     def _cleanup_old_logs(self):
-        """Delete log files older than retention period. Runs once per day."""
+        """Delete log files older than retention period."""
         today = datetime.now().strftime('%Y-%m-%d')
         if self._last_cleanup_date == today:
-            return  # Already ran today
+            return
 
         self._last_cleanup_date = today
         cutoff_date = datetime.now() - timedelta(days=self.config.log_retention_days)
-        deleted_count = 0
 
         try:
             for log_file in self.log_dir.glob('*.csv'):
                 try:
-                    # Parse date from filename (YYYY-MM-DD.csv)
                     file_date = datetime.strptime(log_file.stem, '%Y-%m-%d')
                     if file_date < cutoff_date:
                         log_file.unlink()
-                        deleted_count += 1
+                        logger.info(f"Deleted old log: {log_file.name}")
                 except (ValueError, OSError):
-                    continue  # Skip files that don't match pattern or can't be deleted
-
-            if deleted_count > 0:
-                logger.info(f"Cleaned up {deleted_count} old log file(s)")
+                    continue
         except OSError as e:
             logger.warning(f"Error during log cleanup: {e}")
 
@@ -242,11 +295,9 @@ class CSVLogger:
         date_str = datetime.now().strftime('%Y-%m-%d')
         return self.log_dir / f"{date_str}.csv"
 
-    def log_result(self, result: PingResult):
-        """Log a ping result to the CSV file."""
-        # Run cleanup check (only actually runs once per day)
+    def log_event(self, event_type: str, data: dict):
+        """Log an event to the CSV file."""
         self._cleanup_old_logs()
-
         log_file = self._get_log_filename()
         file_exists = log_file.exists()
 
@@ -254,17 +305,55 @@ class CSVLogger:
             with open(log_file, 'a', newline='') as f:
                 writer = csv.writer(f)
                 if not file_exists:
-                    writer.writerow(['timestamp', 'datetime', 'status', 'ping_ms', 'target'])
-                writer.writerow([
-                    result.timestamp,
-                    result.datetime_str,
-                    result.status,
-                    result.ping_ms if result.ping_ms is not None else '',
-                    result.target
-                ])
+                    writer.writerow(['timestamp', 'datetime', 'event_type', 'details'])
+
+                timestamp = data.get('timestamp', time.time())
+                datetime_str = data.get('datetime_str', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                details = {k: v for k, v in data.items() if k not in ['timestamp', 'datetime_str']}
+
+                writer.writerow([timestamp, datetime_str, event_type, str(details)])
         except OSError as e:
             logger.error(f"Failed to write to log file: {e}")
-            # Continue operation even if logging fails
+
+
+class NtfyNotifier:
+    """Sends notifications via ntfy."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.session = requests.Session()
+
+    def send(self, title: str, message: str, priority: str = 'default', tags: list = None) -> bool:
+        """Send a notification to ntfy."""
+        if not self.config.ntfy_topic:
+            return False
+
+        try:
+            url = f"{self.config.ntfy_server_url}/{self.config.ntfy_topic}"
+            headers = {'Title': title, 'Priority': priority}
+            if tags:
+                headers['Tags'] = ','.join(tags)
+
+            response = self.session.post(url, data=message.encode('utf-8'), headers=headers, timeout=10)
+            return response.status_code == 200
+        except requests.RequestException as e:
+            logger.error(f"Failed to send notification: {e}")
+            return False
+
+    def notify_speed_test(self, result: SpeedTestResult):
+        """Send speed test result notification."""
+        speed = result.speed_mbps
+        if speed < self.config.slow_speed_threshold_mbps:
+            title = f"Speed Test: {speed:.1f} Mbps (SLOW)"
+            priority = 'high'
+            tags = ['warning', 'speedboat']
+        else:
+            title = f"Speed Test: {speed:.1f} Mbps"
+            priority = 'default'
+            tags = ['white_check_mark', 'speedboat']
+
+        message = f"Trigger: {result.trigger}\nDownload: {speed:.1f} Mbps\nDuration: {result.duration_seconds:.1f}s"
+        self.send(title, message, priority, tags)
 
 
 class VPSClient:
@@ -273,23 +362,17 @@ class VPSClient:
     def __init__(self, config: Config):
         self.config = config
         self.session = requests.Session()
-        self.session.timeout = 10
 
     def send_heartbeat(self) -> bool:
         """Send a heartbeat to the VPS."""
         try:
             response = self.session.post(
                 f"{self.config.vps_url}/heartbeat",
-                json={
-                    'timestamp': time.time(),
-                    'datetime': datetime.now().isoformat(),
-                    'source': 'nas-monitor'
-                },
+                json={'timestamp': time.time(), 'datetime': datetime.now().isoformat(), 'source': 'nas-monitor'},
                 timeout=10
             )
             return response.status_code == 200
-        except requests.RequestException as e:
-            logger.debug(f"Failed to send heartbeat: {e}")
+        except requests.RequestException:
             return False
 
     def send_outage_report(self, outage: OutageEvent) -> bool:
@@ -308,8 +391,7 @@ class VPSClient:
                 timeout=10
             )
             return response.status_code == 200
-        except requests.RequestException as e:
-            logger.warning(f"Failed to send outage report: {e}")
+        except requests.RequestException:
             return False
 
 
@@ -319,7 +401,9 @@ class InternetMonitor:
     def __init__(self, config: Config):
         self.config = config
         self.ping_monitor = PingMonitor(config)
-        self.csv_logger = CSVLogger(config)
+        self.speed_tester = SpeedTester(config)
+        self.event_logger = EventLogger(config)
+        self.notifier = NtfyNotifier(config)
         self.vps_client = VPSClient(config)
 
         self.running = False
@@ -327,37 +411,87 @@ class InternetMonitor:
         self.pending_outages: Queue[OutageEvent] = Queue()
         self.last_heartbeat_time = 0
         self.last_status = 'online'
+        self.last_speed_test_time = 0
+        self.in_slow_speed_mode = False
+        self.speed_test_requested = threading.Event()
 
-        # For graceful shutdown
         self._shutdown_event = threading.Event()
 
-    def _handle_status_change(self, result: PingResult):
-        """Handle transitions between online and outage states."""
+    def request_speed_test(self) -> Optional[SpeedTestResult]:
+        """Trigger a manual speed test."""
+        result = self.speed_tester.run_test(trigger='manual')
+        if result:
+            self.event_logger.log_event('speed_test', {
+                'timestamp': result.timestamp,
+                'datetime_str': result.datetime_str,
+                'speed_mbps': result.speed_mbps,
+                'trigger': result.trigger
+            })
+            self.notifier.notify_speed_test(result)
+            self._check_slow_speed(result)
+        return result
+
+    def _check_slow_speed(self, result: SpeedTestResult):
+        """Check if we should enter slow speed mode."""
+        if result.speed_mbps < self.config.slow_speed_threshold_mbps:
+            if not self.in_slow_speed_mode:
+                logger.warning(f"Entering slow speed mode ({result.speed_mbps:.1f} Mbps < {self.config.slow_speed_threshold_mbps} Mbps)")
+                self.in_slow_speed_mode = True
+        else:
+            if self.in_slow_speed_mode:
+                logger.info(f"Exiting slow speed mode ({result.speed_mbps:.1f} Mbps)")
+                self.in_slow_speed_mode = False
+
+    def _maybe_run_speed_test(self, trigger: str) -> Optional[SpeedTestResult]:
+        """Run speed test and log/notify."""
+        result = self.speed_tester.run_test(trigger=trigger)
+        if result:
+            self.last_speed_test_time = time.time()
+            self.event_logger.log_event('speed_test', {
+                'timestamp': result.timestamp,
+                'datetime_str': result.datetime_str,
+                'speed_mbps': result.speed_mbps,
+                'trigger': result.trigger
+            })
+            self.notifier.notify_speed_test(result)
+            self._check_slow_speed(result)
+        return result
+
+    def _handle_status_change(self, result: PingResult) -> bool:
+        """Handle transitions between online and outage states. Returns True if status changed."""
+        status_changed = False
+
         if result.status == 'outage' and self.last_status == 'online':
             # Outage started
-            self.current_outage = OutageEvent(
-                start_time=result.timestamp,
-                start_datetime=result.datetime_str
-            )
+            self.current_outage = OutageEvent(start_time=result.timestamp, start_datetime=result.datetime_str)
             logger.warning(f"OUTAGE DETECTED at {result.datetime_str}")
+            self.event_logger.log_event('outage_start', {
+                'timestamp': result.timestamp,
+                'datetime_str': result.datetime_str
+            })
+            status_changed = True
 
         elif result.status == 'online' and self.last_status == 'outage':
             # Outage ended
             if self.current_outage:
                 self.current_outage.end_time = result.timestamp
                 self.current_outage.end_datetime = result.datetime_str
-                self.current_outage.duration_seconds = (
-                    result.timestamp - self.current_outage.start_time
-                )
+                self.current_outage.duration_seconds = result.timestamp - self.current_outage.start_time
                 duration_min = self.current_outage.duration_seconds / 60
-                logger.info(
-                    f"OUTAGE ENDED at {result.datetime_str} "
-                    f"(duration: {duration_min:.1f} minutes)"
-                )
+                logger.info(f"OUTAGE ENDED at {result.datetime_str} (duration: {duration_min:.1f} minutes)")
+                self.event_logger.log_event('outage_end', {
+                    'timestamp': result.timestamp,
+                    'datetime_str': result.datetime_str,
+                    'duration_seconds': self.current_outage.duration_seconds
+                })
                 self.pending_outages.put(self.current_outage)
                 self.current_outage = None
+                # Run speed test after outage
+                self._maybe_run_speed_test('post_outage')
+            status_changed = True
 
         self.last_status = result.status
+        return status_changed
 
     def _send_pending_outages(self):
         """Send any pending outage reports to the VPS."""
@@ -367,7 +501,6 @@ class InternetMonitor:
                 if self.vps_client.send_outage_report(outage):
                     logger.info("Outage report sent to VPS")
                 else:
-                    # Re-queue if failed
                     self.pending_outages.put(outage)
                     break
             except Empty:
@@ -381,10 +514,7 @@ class InternetMonitor:
             if self.vps_client.send_heartbeat():
                 logger.debug("Heartbeat sent to VPS")
                 self.last_heartbeat_time = current_time
-                # Also try to send pending outages when we have connectivity
                 self._send_pending_outages()
-            else:
-                logger.debug("Failed to send heartbeat (VPS may be unreachable)")
 
     def run(self):
         """Main monitoring loop."""
@@ -392,43 +522,60 @@ class InternetMonitor:
         logger.info("NAS Internet Monitor started")
         logger.info(f"Ping targets: {self.config.ping_targets}")
         logger.info(f"Ping interval: {self.config.ping_interval_seconds}s")
-        logger.info(f"Heartbeat interval: {self.config.heartbeat_interval_seconds}s")
         logger.info(f"VPS URL: {self.config.vps_url}")
-        logger.info(f"Log directory: {self.config.log_directory}")
+        logger.info(f"High latency threshold: {self.config.high_latency_threshold_ms}ms")
+        logger.info(f"Slow speed threshold: {self.config.slow_speed_threshold_mbps} Mbps")
+        logger.info(f"HTTP server port: {self.config.http_port}")
 
-        # Send initial heartbeat
         self._maybe_send_heartbeat()
 
         while self.running and not self._shutdown_event.is_set():
             try:
+                # Check for manual speed test request
+                if self.speed_test_requested.is_set():
+                    self.request_speed_test()
+                    self.speed_test_requested.clear()
+
                 # Check connectivity
                 result = self.ping_monitor.check_connectivity()
+                status_changed = self._handle_status_change(result)
 
-                # Log to CSV
-                self.csv_logger.log_result(result)
+                # Log high latency
+                if result.status == 'online' and result.ping_ms:
+                    if result.ping_ms > self.config.high_latency_threshold_ms:
+                        logger.warning(f"High latency: {result.ping_ms:.1f}ms")
+                        self.event_logger.log_event('high_latency', {
+                            'timestamp': result.timestamp,
+                            'datetime_str': result.datetime_str,
+                            'ping_ms': result.ping_ms
+                        })
+                        # Trigger speed test on high latency
+                        self._maybe_run_speed_test('high_latency')
 
-                # Handle status changes
-                self._handle_status_change(result)
+                # Check if we need frequent speed tests (slow speed mode)
+                if self.in_slow_speed_mode:
+                    time_since_test = time.time() - self.last_speed_test_time
+                    if time_since_test >= self.config.slow_speed_test_interval_seconds:
+                        self._maybe_run_speed_test('slow_speed_retest')
 
-                # Log current status
-                if result.status == 'online':
-                    logger.info(
-                        f"Status: {result.status} | "
-                        f"Ping: {result.ping_ms:.1f}ms" if result.ping_ms else
-                        f"Status: {result.status}"
-                    )
+                # Log status (only on change or hourly)
+                if status_changed:
+                    if result.status == 'online':
+                        logger.info(f"Status: ONLINE | Ping: {result.ping_ms:.1f}ms" if result.ping_ms else "Status: ONLINE")
+                    else:
+                        logger.warning("Status: OUTAGE")
                 else:
-                    logger.warning(f"Status: {result.status}")
+                    # Periodic status log (every ~10 min for visibility)
+                    if int(time.time()) % 600 < self.config.ping_interval_seconds:
+                        if result.status == 'online' and result.ping_ms:
+                            logger.info(f"Status: online | Ping: {result.ping_ms:.1f}ms")
 
-                # Send heartbeat if appropriate
                 self._maybe_send_heartbeat()
-
-                # Wait for next check
                 self._shutdown_event.wait(self.config.ping_interval_seconds)
 
             except Exception as e:
                 logger.error(f"Error in monitoring loop: {e}")
-                self._shutdown_event.wait(5)  # Brief pause before retry
+                self._shutdown_event.wait(5)
 
         logger.info("NAS Internet Monitor stopped")
 
@@ -438,16 +585,62 @@ class InternetMonitor:
         self._shutdown_event.set()
 
 
+class RequestHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for manual triggers."""
+    monitor: InternetMonitor = None
+
+    def log_message(self, format, *args):
+        logger.debug(f"HTTP: {args[0]}")
+
+    def do_GET(self):
+        if self.path == '/speedtest':
+            result = self.monitor.request_speed_test()
+            if result:
+                response = f'{{"speed_mbps": {result.speed_mbps:.1f}, "trigger": "{result.trigger}"}}'
+                self.send_response(200)
+            else:
+                response = '{"error": "Speed test failed"}'
+                self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(response.encode())
+
+        elif self.path == '/status':
+            status = {
+                'running': self.monitor.running,
+                'last_status': self.monitor.last_status,
+                'in_slow_speed_mode': self.monitor.in_slow_speed_mode,
+                'last_speed_test': self.monitor.last_speed_test_time
+            }
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(str(status).replace("'", '"').encode())
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def run_http_server(monitor: InternetMonitor, port: int):
+    """Run the HTTP server in a separate thread."""
+    RequestHandler.monitor = monitor
+    server = HTTPServer(('0.0.0.0', port), RequestHandler)
+    logger.info(f"HTTP server listening on port {port}")
+    server.serve_forever()
+
+
 def main():
     """Main entry point."""
-    # Load configuration
     config_path = os.environ.get('CONFIG_PATH', 'config.yaml')
     config = Config.load(config_path)
 
-    # Create and run monitor
     monitor = InternetMonitor(config)
 
-    # Setup signal handlers for graceful shutdown
+    # Start HTTP server thread
+    http_thread = threading.Thread(target=run_http_server, args=(monitor, config.http_port), daemon=True)
+    http_thread.start()
+
     def signal_handler(signum, frame):
         logger.info(f"Received signal {signum}, shutting down...")
         monitor.stop()

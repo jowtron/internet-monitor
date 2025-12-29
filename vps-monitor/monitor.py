@@ -19,7 +19,7 @@ from typing import Optional
 
 import requests
 import yaml
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 
 # Configure logging
 logging.basicConfig(
@@ -43,6 +43,7 @@ class Config:
     ntfy_server_url: str = 'https://ntfy.sh'
     ntfy_topic: str = ''
     outage_log_file: str = './outages.log'
+    speedtest_file: str = './speedtest/10MB.bin'
     # Grace period after startup before sending DOWN notifications
     startup_grace_seconds: int = 120
 
@@ -330,6 +331,19 @@ class VPSMonitor:
         def health():
             """Health check endpoint."""
             return jsonify({'status': 'healthy', 'timestamp': time.time()})
+
+        @self.app.route('/speedtest', methods=['GET'])
+        def speedtest():
+            """Serve speedtest file for download speed measurement."""
+            speedtest_path = Path(self.config.speedtest_file)
+            if not speedtest_path.exists():
+                return jsonify({'error': 'Speedtest file not found'}), 404
+            return send_file(
+                speedtest_path,
+                mimetype='application/octet-stream',
+                as_attachment=True,
+                download_name='speedtest.bin'
+            )
 
     def _check_loop(self):
         """Background loop to check for missed heartbeats."""
