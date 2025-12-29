@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from queue import Queue, Empty
 from typing import Optional
@@ -43,6 +43,7 @@ class Config:
     heartbeat_interval_seconds: int = 60
     vps_url: str = 'http://100.64.0.1:5000'  # Tailscale IP
     log_directory: str = './logs'
+    log_retention_days: int = 365  # Keep logs for 1 year
     ntfy_topic: str = ''  # Optional direct ntfy notifications from NAS
 
     @classmethod
@@ -66,6 +67,7 @@ class Config:
             'HEARTBEAT_INTERVAL': ('heartbeat_interval_seconds', int),
             'VPS_URL': ('vps_url', str),
             'LOG_DIRECTORY': ('log_directory', str),
+            'LOG_RETENTION_DAYS': ('log_retention_days', int),
             'NTFY_TOPIC': ('ntfy_topic', str),
         }
 
@@ -199,6 +201,7 @@ class CSVLogger:
         self.config = config
         self.log_dir = Path(config.log_directory)
         self._ensure_log_directory()
+        self._last_cleanup_date: Optional[str] = None
 
     def _ensure_log_directory(self):
         """Create log directory if it doesn't exist."""
@@ -208,6 +211,32 @@ class CSVLogger:
             logger.error(f"Failed to create log directory: {e}")
             raise
 
+    def _cleanup_old_logs(self):
+        """Delete log files older than retention period. Runs once per day."""
+        today = datetime.now().strftime('%Y-%m-%d')
+        if self._last_cleanup_date == today:
+            return  # Already ran today
+
+        self._last_cleanup_date = today
+        cutoff_date = datetime.now() - timedelta(days=self.config.log_retention_days)
+        deleted_count = 0
+
+        try:
+            for log_file in self.log_dir.glob('*.csv'):
+                try:
+                    # Parse date from filename (YYYY-MM-DD.csv)
+                    file_date = datetime.strptime(log_file.stem, '%Y-%m-%d')
+                    if file_date < cutoff_date:
+                        log_file.unlink()
+                        deleted_count += 1
+                except (ValueError, OSError):
+                    continue  # Skip files that don't match pattern or can't be deleted
+
+            if deleted_count > 0:
+                logger.info(f"Cleaned up {deleted_count} old log file(s)")
+        except OSError as e:
+            logger.warning(f"Error during log cleanup: {e}")
+
     def _get_log_filename(self) -> Path:
         """Get the log filename for the current date."""
         date_str = datetime.now().strftime('%Y-%m-%d')
@@ -215,6 +244,9 @@ class CSVLogger:
 
     def log_result(self, result: PingResult):
         """Log a ping result to the CSV file."""
+        # Run cleanup check (only actually runs once per day)
+        self._cleanup_old_logs()
+
         log_file = self._get_log_filename()
         file_exists = log_file.exists()
 
