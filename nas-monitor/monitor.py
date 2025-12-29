@@ -576,25 +576,65 @@ class InternetMonitor:
                 self.in_slow_speed_mode = False
 
     def _maybe_run_speed_test(self, trigger: str, only_log_if_slow: bool = False) -> Optional[SpeedTestResult]:
-        """Run speed test and log/notify. If only_log_if_slow, only log+notify when below threshold."""
+        """Run speed test with triage: if VPS test shows slow, confirm with Ookla."""
         result = self.speed_tester.run_test(trigger=trigger)
-        if result:
-            self.last_speed_test_time = time.time()
-            is_slow = result.speed_mbps < self.config.slow_speed_threshold_mbps
+        if not result:
+            return None
 
-            # Always log and notify unless only_log_if_slow and speed is fine
-            if not only_log_if_slow or is_slow:
+        self.last_speed_test_time = time.time()
+        vps_speed = result.speed_mbps
+        is_slow = vps_speed < self.config.slow_speed_threshold_mbps
+
+        # If VPS test shows slow speed, run Ookla to confirm
+        if is_slow and SPEEDTEST_AVAILABLE:
+            logger.info(f"VPS test shows {vps_speed:.1f} Mbps - running Ookla to confirm...")
+            ookla_result = self.speed_tester.run_ookla_test(trigger=f"{trigger}_confirm")
+
+            if ookla_result:
+                # Use Ookla result as the authoritative measurement
+                confirmed_slow = ookla_result.speed_mbps < self.config.slow_speed_threshold_mbps
+
+                # Log both results
                 self.event_logger.log_event('speed_test', {
                     'timestamp': result.timestamp,
                     'datetime_str': result.datetime_str,
-                    'speed_mbps': result.speed_mbps,
-                    'trigger': result.trigger
+                    'vps_speed_mbps': vps_speed,
+                    'ookla_speed_mbps': ookla_result.speed_mbps,
+                    'upload_mbps': ookla_result.upload_mbps,
+                    'trigger': trigger,
+                    'confirmed_slow': confirmed_slow
                 })
-                self.notifier.notify_speed_test(result)
-            else:
-                logger.debug(f"Scheduled speed test: {result.speed_mbps:.1f} Mbps (OK, not logged)")
 
-            self._check_slow_speed(result)
+                # Notify with combined info
+                if confirmed_slow:
+                    title = f"Speed Test: {ookla_result.speed_mbps:.1f} Mbps (CONFIRMED SLOW)"
+                    priority = 'high'
+                    tags = ['warning', 'speedboat']
+                else:
+                    title = f"Speed Test: {ookla_result.speed_mbps:.1f} Mbps (OK)"
+                    priority = 'default'
+                    tags = ['white_check_mark', 'speedboat']
+
+                message = f"VPS quick test: {vps_speed:.1f} Mbps\nOokla download: {ookla_result.speed_mbps:.1f} Mbps\nOokla upload: {ookla_result.upload_mbps:.1f} Mbps\nTrigger: {trigger}"
+                self.notifier.send(title, message, priority, tags)
+
+                # Use Ookla result for slow speed mode decision
+                self._check_slow_speed(ookla_result)
+                return ookla_result
+
+        # Normal path: VPS test was fine, or Ookla not available
+        if not only_log_if_slow or is_slow:
+            self.event_logger.log_event('speed_test', {
+                'timestamp': result.timestamp,
+                'datetime_str': result.datetime_str,
+                'speed_mbps': result.speed_mbps,
+                'trigger': result.trigger
+            })
+            self.notifier.notify_speed_test(result)
+        else:
+            logger.debug(f"Scheduled speed test: {result.speed_mbps:.1f} Mbps (OK, not logged)")
+
+        self._check_slow_speed(result)
         return result
 
     def _handle_status_change(self, result: PingResult) -> bool:
