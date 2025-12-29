@@ -26,11 +26,17 @@ from typing import Optional
 import requests
 import yaml
 
-try:
-    import speedtest
-    SPEEDTEST_AVAILABLE = True
-except ImportError:
-    SPEEDTEST_AVAILABLE = False
+
+def check_speedtest_cli() -> bool:
+    """Check if the official Ookla speedtest CLI is available."""
+    try:
+        result = subprocess.run(['speedtest', '--version'], capture_output=True, timeout=5)
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+SPEEDTEST_AVAILABLE = check_speedtest_cli()
 
 # Configure logging
 logging.basicConfig(
@@ -264,9 +270,9 @@ class SpeedTester:
             return None
 
     def run_ookla_test(self, trigger: str = 'manual') -> Optional[SpeedTestResult]:
-        """Run a full Ookla speed test (slower but more accurate)."""
+        """Run a full Ookla speed test using official CLI (slower but more accurate)."""
         if not SPEEDTEST_AVAILABLE:
-            logger.error("speedtest-cli not installed")
+            logger.error("Ookla speedtest CLI not installed")
             return None
 
         timestamp = time.time()
@@ -276,28 +282,48 @@ class SpeedTester:
             logger.info("Running Ookla speed test (this may take 30-60 seconds)...")
             start_time = time.time()
 
-            st = speedtest.Speedtest()
-            st.get_best_server()
-            download_speed = st.download() / 1_000_000  # Convert to Mbps
-            upload_speed = st.upload() / 1_000_000  # Convert to Mbps
+            # Run official Ookla CLI with JSON output
+            result = subprocess.run(
+                ['speedtest', '--accept-license', '--accept-gdpr', '--format=json'],
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
 
             end_time = time.time()
             duration = end_time - start_time
 
-            result = SpeedTestResult(
+            if result.returncode != 0:
+                logger.error(f"Ookla CLI failed: {result.stderr}")
+                return None
+
+            # Parse JSON output
+            data = json.loads(result.stdout)
+
+            # Bandwidth is in bytes per second, convert to Mbps
+            download_speed = (data['download']['bandwidth'] * 8) / 1_000_000
+            upload_speed = (data['upload']['bandwidth'] * 8) / 1_000_000
+
+            speed_result = SpeedTestResult(
                 timestamp=timestamp,
                 datetime_str=datetime_str,
                 speed_mbps=download_speed,
                 duration_seconds=duration,
-                file_size_bytes=0,
+                file_size_bytes=data['download'].get('bytes', 0),
                 trigger=trigger,
                 upload_mbps=upload_speed,
                 test_type='ookla'
             )
 
             logger.info(f"Speed test (Ookla): {download_speed:.1f} Mbps down, {upload_speed:.1f} Mbps up ({trigger})")
-            return result
+            return speed_result
 
+        except subprocess.TimeoutExpired:
+            logger.error("Ookla speed test timed out after 120 seconds")
+            return None
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse Ookla output: {e}")
+            return None
         except Exception as e:
             logger.error(f"Ookla speed test failed: {e}")
             return None
