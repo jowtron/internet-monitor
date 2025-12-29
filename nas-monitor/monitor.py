@@ -546,11 +546,11 @@ class InternetMonitor:
         if ookla_ul is not None:
             lines.append(f"Ookla Upload: {ookla_ul:.1f} Mbps")
 
-        # Check if any speed is slow
+        # Check if any download speed is slow (upload has different expectations)
         threshold = self.config.slow_speed_threshold_mbps
         is_slow = any(
             v is not None and v < threshold
-            for v in [vps_dl, ookla_dl, ookla_ul]
+            for v in [vps_dl, ookla_dl]
         )
 
         if is_slow:
