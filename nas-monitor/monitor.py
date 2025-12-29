@@ -605,18 +605,13 @@ class InternetMonitor:
                     'confirmed_slow': confirmed_slow
                 })
 
-                # Notify with combined info
+                # Only notify if confirmed slow (skip false alarms)
                 if confirmed_slow:
                     title = f"Speed Test: {ookla_result.speed_mbps:.1f} Mbps (CONFIRMED SLOW)"
-                    priority = 'high'
-                    tags = ['warning', 'speedboat']
+                    message = f"VPS quick test: {vps_speed:.1f} Mbps\nOokla download: {ookla_result.speed_mbps:.1f} Mbps\nOokla upload: {ookla_result.upload_mbps:.1f} Mbps\nTrigger: {trigger}"
+                    self.notifier.send(title, message, priority='high', tags=['warning', 'speedboat'])
                 else:
-                    title = f"Speed Test: {ookla_result.speed_mbps:.1f} Mbps (OK)"
-                    priority = 'default'
-                    tags = ['white_check_mark', 'speedboat']
-
-                message = f"VPS quick test: {vps_speed:.1f} Mbps\nOokla download: {ookla_result.speed_mbps:.1f} Mbps\nOokla upload: {ookla_result.upload_mbps:.1f} Mbps\nTrigger: {trigger}"
-                self.notifier.send(title, message, priority, tags)
+                    logger.info(f"VPS false alarm: {vps_speed:.1f} Mbps, Ookla confirmed {ookla_result.speed_mbps:.1f} Mbps (OK)")
 
                 # Use Ookla result for slow speed mode decision
                 self._check_slow_speed(ookla_result)
