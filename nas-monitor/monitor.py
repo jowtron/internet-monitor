@@ -51,6 +51,7 @@ class Config:
     high_latency_threshold_ms: int = 200  # Trigger speed test above this
     slow_speed_threshold_mbps: float = 50.0  # Trigger frequent tests below this
     slow_speed_test_interval_seconds: int = 300  # 5 min when speed is slow
+    scheduled_speed_test_interval_seconds: int = 3600  # Hourly speed test
     # HTTP server for manual triggers
     http_port: int = 8080
 
@@ -80,6 +81,7 @@ class Config:
             'NTFY_TOPIC': ('ntfy_topic', str),
             'HIGH_LATENCY_THRESHOLD': ('high_latency_threshold_ms', int),
             'SLOW_SPEED_THRESHOLD': ('slow_speed_threshold_mbps', float),
+            'SCHEDULED_SPEED_TEST_INTERVAL': ('scheduled_speed_test_interval_seconds', int),
             'HTTP_PORT': ('http_port', int),
         }
 
@@ -412,6 +414,7 @@ class InternetMonitor:
         self.last_heartbeat_time = 0
         self.last_status = 'online'
         self.last_speed_test_time = 0
+        self.last_scheduled_test_time = 0
         self.in_slow_speed_mode = False
         self.speed_test_requested = threading.Event()
 
@@ -442,18 +445,25 @@ class InternetMonitor:
                 logger.info(f"Exiting slow speed mode ({result.speed_mbps:.1f} Mbps)")
                 self.in_slow_speed_mode = False
 
-    def _maybe_run_speed_test(self, trigger: str) -> Optional[SpeedTestResult]:
-        """Run speed test and log/notify."""
+    def _maybe_run_speed_test(self, trigger: str, only_log_if_slow: bool = False) -> Optional[SpeedTestResult]:
+        """Run speed test and log/notify. If only_log_if_slow, only log+notify when below threshold."""
         result = self.speed_tester.run_test(trigger=trigger)
         if result:
             self.last_speed_test_time = time.time()
-            self.event_logger.log_event('speed_test', {
-                'timestamp': result.timestamp,
-                'datetime_str': result.datetime_str,
-                'speed_mbps': result.speed_mbps,
-                'trigger': result.trigger
-            })
-            self.notifier.notify_speed_test(result)
+            is_slow = result.speed_mbps < self.config.slow_speed_threshold_mbps
+
+            # Always log and notify unless only_log_if_slow and speed is fine
+            if not only_log_if_slow or is_slow:
+                self.event_logger.log_event('speed_test', {
+                    'timestamp': result.timestamp,
+                    'datetime_str': result.datetime_str,
+                    'speed_mbps': result.speed_mbps,
+                    'trigger': result.trigger
+                })
+                self.notifier.notify_speed_test(result)
+            else:
+                logger.debug(f"Scheduled speed test: {result.speed_mbps:.1f} Mbps (OK, not logged)")
+
             self._check_slow_speed(result)
         return result
 
@@ -525,6 +535,7 @@ class InternetMonitor:
         logger.info(f"VPS URL: {self.config.vps_url}")
         logger.info(f"High latency threshold: {self.config.high_latency_threshold_ms}ms")
         logger.info(f"Slow speed threshold: {self.config.slow_speed_threshold_mbps} Mbps")
+        logger.info(f"Scheduled speed test: every {self.config.scheduled_speed_test_interval_seconds}s (log only if slow)")
         logger.info(f"HTTP server port: {self.config.http_port}")
 
         self._maybe_send_heartbeat()
@@ -557,6 +568,12 @@ class InternetMonitor:
                     time_since_test = time.time() - self.last_speed_test_time
                     if time_since_test >= self.config.slow_speed_test_interval_seconds:
                         self._maybe_run_speed_test('slow_speed_retest')
+
+                # Scheduled hourly speed test (only log if slow)
+                time_since_scheduled = time.time() - self.last_scheduled_test_time
+                if time_since_scheduled >= self.config.scheduled_speed_test_interval_seconds:
+                    self.last_scheduled_test_time = time.time()
+                    self._maybe_run_speed_test('scheduled', only_log_if_slow=True)
 
                 # Log status (only on change or hourly)
                 if status_changed:
