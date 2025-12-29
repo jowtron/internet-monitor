@@ -8,6 +8,7 @@ runs speed tests when triggered, and sends heartbeats to a VPS monitor over Tail
 
 import csv
 import io
+import json
 import logging
 import os
 import signal
@@ -24,6 +25,12 @@ from typing import Optional
 
 import requests
 import yaml
+
+try:
+    import speedtest
+    SPEEDTEST_AVAILABLE = True
+except ImportError:
+    SPEEDTEST_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -114,7 +121,9 @@ class SpeedTestResult:
     speed_mbps: float
     duration_seconds: float
     file_size_bytes: int
-    trigger: str  # 'manual', 'post_outage', 'high_latency', 'slow_speed_retest'
+    trigger: str  # 'manual', 'post_outage', 'high_latency', 'slow_speed_retest', 'scheduled'
+    upload_mbps: Optional[float] = None  # Only for Ookla tests
+    test_type: str = 'vps'  # 'vps' or 'ookla'
 
 
 @dataclass
@@ -204,7 +213,7 @@ class PingMonitor:
 
 
 class SpeedTester:
-    """Handles speed tests by downloading file from VPS."""
+    """Handles speed tests by downloading file from VPS or using Ookla."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -243,14 +252,54 @@ class SpeedTester:
                 speed_mbps=speed_mbps,
                 duration_seconds=duration,
                 file_size_bytes=total_bytes,
-                trigger=trigger
+                trigger=trigger,
+                test_type='vps'
             )
 
-            logger.info(f"Speed test: {speed_mbps:.1f} Mbps ({trigger})")
+            logger.info(f"Speed test (VPS): {speed_mbps:.1f} Mbps ({trigger})")
             return result
 
         except requests.RequestException as e:
             logger.error(f"Speed test failed: {e}")
+            return None
+
+    def run_ookla_test(self, trigger: str = 'manual') -> Optional[SpeedTestResult]:
+        """Run a full Ookla speed test (slower but more accurate)."""
+        if not SPEEDTEST_AVAILABLE:
+            logger.error("speedtest-cli not installed")
+            return None
+
+        timestamp = time.time()
+        datetime_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        try:
+            logger.info("Running Ookla speed test (this may take 30-60 seconds)...")
+            start_time = time.time()
+
+            st = speedtest.Speedtest()
+            st.get_best_server()
+            download_speed = st.download() / 1_000_000  # Convert to Mbps
+            upload_speed = st.upload() / 1_000_000  # Convert to Mbps
+
+            end_time = time.time()
+            duration = end_time - start_time
+
+            result = SpeedTestResult(
+                timestamp=timestamp,
+                datetime_str=datetime_str,
+                speed_mbps=download_speed,
+                duration_seconds=duration,
+                file_size_bytes=0,
+                trigger=trigger,
+                upload_mbps=upload_speed,
+                test_type='ookla'
+            )
+
+            logger.info(f"Speed test (Ookla): {download_speed:.1f} Mbps down, {upload_speed:.1f} Mbps up ({trigger})")
+            return result
+
+        except Exception as e:
+            logger.error(f"Ookla speed test failed: {e}")
             return None
 
 
@@ -354,7 +403,10 @@ class NtfyNotifier:
             priority = 'default'
             tags = ['white_check_mark', 'speedboat']
 
-        message = f"Trigger: {result.trigger}\nDownload: {speed:.1f} Mbps\nDuration: {result.duration_seconds:.1f}s"
+        message = f"Type: {result.test_type}\nTrigger: {result.trigger}\nDownload: {speed:.1f} Mbps"
+        if result.upload_mbps is not None:
+            message += f"\nUpload: {result.upload_mbps:.1f} Mbps"
+        message += f"\nDuration: {result.duration_seconds:.1f}s"
         self.send(title, message, priority, tags)
 
 
@@ -420,19 +472,97 @@ class InternetMonitor:
 
         self._shutdown_event = threading.Event()
 
-    def request_speed_test(self) -> Optional[SpeedTestResult]:
+    def request_speed_test(self, use_ookla: bool = False) -> Optional[SpeedTestResult]:
         """Trigger a manual speed test."""
-        result = self.speed_tester.run_test(trigger='manual')
+        if use_ookla:
+            result = self.speed_tester.run_ookla_test(trigger='manual')
+        else:
+            result = self.speed_tester.run_test(trigger='manual')
+
         if result:
-            self.event_logger.log_event('speed_test', {
+            log_data = {
                 'timestamp': result.timestamp,
                 'datetime_str': result.datetime_str,
                 'speed_mbps': result.speed_mbps,
-                'trigger': result.trigger
-            })
+                'trigger': result.trigger,
+                'test_type': result.test_type
+            }
+            if result.upload_mbps is not None:
+                log_data['upload_mbps'] = result.upload_mbps
+            self.event_logger.log_event('speed_test', log_data)
             self.notifier.notify_speed_test(result)
             self._check_slow_speed(result)
         return result
+
+    def request_full_speed_test(self) -> dict:
+        """Run all speed tests (VPS + Ookla) and send combined notification."""
+        results = {}
+
+        # Run VPS download test
+        logger.info("Running full speed test suite...")
+        vps_result = self.speed_tester.run_test(trigger='manual_full')
+        if vps_result:
+            results['vps_download_mbps'] = vps_result.speed_mbps
+            self.event_logger.log_event('speed_test', {
+                'timestamp': vps_result.timestamp,
+                'datetime_str': vps_result.datetime_str,
+                'speed_mbps': vps_result.speed_mbps,
+                'trigger': 'manual_full',
+                'test_type': 'vps'
+            })
+
+        # Run Ookla test (download + upload)
+        ookla_result = self.speed_tester.run_ookla_test(trigger='manual_full')
+        if ookla_result:
+            results['ookla_download_mbps'] = ookla_result.speed_mbps
+            results['ookla_upload_mbps'] = ookla_result.upload_mbps
+            self.event_logger.log_event('speed_test', {
+                'timestamp': ookla_result.timestamp,
+                'datetime_str': ookla_result.datetime_str,
+                'speed_mbps': ookla_result.speed_mbps,
+                'upload_mbps': ookla_result.upload_mbps,
+                'trigger': 'manual_full',
+                'test_type': 'ookla'
+            })
+
+        # Send combined notification
+        if results:
+            self._notify_full_speed_test(results)
+
+        return results
+
+    def _notify_full_speed_test(self, results: dict):
+        """Send a combined notification for full speed test."""
+        lines = ["Full Speed Test Results:", ""]
+
+        vps_dl = results.get('vps_download_mbps')
+        ookla_dl = results.get('ookla_download_mbps')
+        ookla_ul = results.get('ookla_upload_mbps')
+
+        if vps_dl is not None:
+            lines.append(f"VPS Download: {vps_dl:.1f} Mbps")
+        if ookla_dl is not None:
+            lines.append(f"Ookla Download: {ookla_dl:.1f} Mbps")
+        if ookla_ul is not None:
+            lines.append(f"Ookla Upload: {ookla_ul:.1f} Mbps")
+
+        # Check if any speed is slow
+        threshold = self.config.slow_speed_threshold_mbps
+        is_slow = any(
+            v is not None and v < threshold
+            for v in [vps_dl, ookla_dl, ookla_ul]
+        )
+
+        if is_slow:
+            title = "Full Speed Test: SLOW"
+            priority = 'high'
+            tags = ['warning', 'speedboat']
+        else:
+            title = "Full Speed Test: OK"
+            priority = 'default'
+            tags = ['white_check_mark', 'speedboat']
+
+        self.notifier.send(title, "\n".join(lines), priority, tags)
 
     def _check_slow_speed(self, result: SpeedTestResult):
         """Check if we should enter slow speed mode."""
@@ -611,13 +741,38 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/speedtest':
-            result = self.monitor.request_speed_test()
+            result = self.monitor.request_speed_test(use_ookla=False)
             if result:
-                response = f'{{"speed_mbps": {result.speed_mbps:.1f}, "trigger": "{result.trigger}"}}'
+                response = f'{{"speed_mbps": {result.speed_mbps:.1f}, "trigger": "{result.trigger}", "test_type": "{result.test_type}"}}'
                 self.send_response(200)
             else:
                 response = '{"error": "Speed test failed"}'
                 self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(response.encode())
+
+        elif self.path == '/speedtest/ookla':
+            result = self.monitor.request_speed_test(use_ookla=True)
+            if result:
+                upload = result.upload_mbps if result.upload_mbps else 0
+                response = f'{{"download_mbps": {result.speed_mbps:.1f}, "upload_mbps": {upload:.1f}, "test_type": "{result.test_type}"}}'
+                self.send_response(200)
+            else:
+                response = '{"error": "Ookla speed test failed"}'
+                self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(response.encode())
+
+        elif self.path == '/speedtest/full':
+            results = self.monitor.request_full_speed_test()
+            if results:
+                self.send_response(200)
+                response = json.dumps(results, indent=2)
+            else:
+                self.send_response(500)
+                response = '{"error": "Full speed test failed"}'
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(response.encode())
