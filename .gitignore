@@ -17,6 +17,9 @@ logs/
 *.log
 outages.log
 
+# Database
+*.db
+
 # Config with secrets
 config.yaml
 .env
