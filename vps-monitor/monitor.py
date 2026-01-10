@@ -3,23 +3,25 @@
 VPS Internet Monitor
 
 Receives heartbeats from NAS monitor over Tailscale, tracks connectivity status,
-and sends ntfy notifications when the home network goes down or recovers.
+stores event history, provides a dashboard, and sends ntfy notifications.
 """
 
+import json
 import logging
 import os
 import signal
+import sqlite3
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 import requests
 import yaml
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request, send_file, Response
 
 # Configure logging
 logging.basicConfig(
@@ -31,6 +33,381 @@ logger = logging.getLogger(__name__)
 
 # Reduce Flask/Werkzeug logging noise
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
+
+DASHBOARD_HTML = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Internet Monitor Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 {
+            font-size: 1.5rem;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        .status-dot.online { background: #22c55e; }
+        .status-dot.offline { background: #ef4444; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .card {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #334155;
+        }
+        .card h2 {
+            font-size: 0.875rem;
+            color: #94a3b8;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #f8fafc;
+        }
+        .stat-unit {
+            font-size: 1rem;
+            color: #64748b;
+            margin-left: 4px;
+        }
+        .stat-sub {
+            font-size: 0.875rem;
+            color: #64748b;
+            margin-top: 4px;
+        }
+        .chart-container {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #334155;
+            margin-bottom: 20px;
+        }
+        .chart-container h2 {
+            font-size: 1rem;
+            margin-bottom: 15px;
+            color: #f8fafc;
+        }
+        .chart-wrapper {
+            position: relative;
+            height: 250px;
+        }
+        .time-selector {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+        }
+        .time-btn {
+            padding: 8px 16px;
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            color: #94a3b8;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .time-btn:hover { background: #334155; }
+        .time-btn.active {
+            background: #3b82f6;
+            border-color: #3b82f6;
+            color: white;
+        }
+        .events-list {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .event-item {
+            padding: 10px;
+            border-bottom: 1px solid #334155;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .event-item:last-child { border-bottom: none; }
+        .event-type {
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .event-type.speed_test { background: #3b82f6; }
+        .event-type.high_latency { background: #f59e0b; }
+        .event-type.down, .event-type.outage_start { background: #ef4444; }
+        .event-type.restored, .event-type.outage_end { background: #22c55e; }
+        .event-time { color: #64748b; font-size: 0.875rem; }
+        .no-data {
+            color: #64748b;
+            text-align: center;
+            padding: 40px;
+        }
+        .refresh-info {
+            text-align: right;
+            font-size: 0.75rem;
+            color: #64748b;
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>
+            <span class="status-dot" id="statusDot"></span>
+            Internet Monitor
+        </h1>
+
+        <div class="refresh-info">Auto-refreshes every 30 seconds | Last update: <span id="lastUpdate">-</span></div>
+
+        <div class="time-selector">
+            <button class="time-btn" data-hours="1">1h</button>
+            <button class="time-btn" data-hours="6">6h</button>
+            <button class="time-btn active" data-hours="24">24h</button>
+            <button class="time-btn" data-hours="168">7d</button>
+            <button class="time-btn" data-hours="720">30d</button>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <h2>Status</h2>
+                <div class="stat-value" id="statusText">-</div>
+                <div class="stat-sub" id="lastHeartbeat">Last heartbeat: -</div>
+            </div>
+            <div class="card">
+                <h2>Avg Speed</h2>
+                <div class="stat-value"><span id="avgSpeed">-</span><span class="stat-unit">Mbps</span></div>
+                <div class="stat-sub" id="speedRange">-</div>
+            </div>
+            <div class="card">
+                <h2>Outages</h2>
+                <div class="stat-value" id="outageCount">-</div>
+                <div class="stat-sub" id="totalDowntime">Total downtime: -</div>
+            </div>
+            <div class="card">
+                <h2>High Latency Events</h2>
+                <div class="stat-value" id="latencyCount">-</div>
+                <div class="stat-sub">Above threshold</div>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <h2>Download Speed Over Time</h2>
+            <div class="chart-wrapper">
+                <canvas id="speedChart"></canvas>
+            </div>
+        </div>
+
+        <div class="grid">
+            <div class="chart-container" style="margin-bottom: 0;">
+                <h2>Upload Speed Over Time</h2>
+                <div class="chart-wrapper">
+                    <canvas id="uploadChart"></canvas>
+                </div>
+            </div>
+            <div class="chart-container" style="margin-bottom: 0;">
+                <h2>Latency Events</h2>
+                <div class="chart-wrapper">
+                    <canvas id="latencyChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <h2>Recent Events</h2>
+            <div class="events-list" id="eventsList">
+                <div class="no-data">No events yet</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let speedChart, uploadChart, latencyChart;
+        let selectedHours = 24;
+
+        const chartOptions = {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false }
+            },
+            scales: {
+                x: {
+                    type: 'time',
+                    time: { displayFormats: { hour: 'MMM d, HH:mm' } },
+                    grid: { color: '#334155' },
+                    ticks: { color: '#64748b' }
+                },
+                y: {
+                    grid: { color: '#334155' },
+                    ticks: { color: '#64748b' }
+                }
+            }
+        };
+
+        function initCharts() {
+            const speedCtx = document.getElementById('speedChart').getContext('2d');
+            speedChart = new Chart(speedCtx, {
+                type: 'line',
+                data: { datasets: [{ label: 'Download', borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.1)', fill: true, tension: 0.3, data: [] }] },
+                options: { ...chartOptions, scales: { ...chartOptions.scales, y: { ...chartOptions.scales.y, title: { display: true, text: 'Mbps', color: '#64748b' } } } }
+            });
+
+            const uploadCtx = document.getElementById('uploadChart').getContext('2d');
+            uploadChart = new Chart(uploadCtx, {
+                type: 'line',
+                data: { datasets: [{ label: 'Upload', borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,0.1)', fill: true, tension: 0.3, data: [] }] },
+                options: { ...chartOptions, scales: { ...chartOptions.scales, y: { ...chartOptions.scales.y, title: { display: true, text: 'Mbps', color: '#64748b' } } } }
+            });
+
+            const latencyCtx = document.getElementById('latencyChart').getContext('2d');
+            latencyChart = new Chart(latencyCtx, {
+                type: 'scatter',
+                data: { datasets: [{ label: 'Latency', borderColor: '#f59e0b', backgroundColor: '#f59e0b', data: [] }] },
+                options: { ...chartOptions, scales: { ...chartOptions.scales, y: { ...chartOptions.scales.y, title: { display: true, text: 'ms', color: '#64748b' } } } }
+            });
+        }
+
+        async function fetchData() {
+            try {
+                const [summaryRes, historyRes] = await Promise.all([
+                    fetch(`/api/summary?hours=${selectedHours}`),
+                    fetch(`/api/history?hours=${selectedHours}`)
+                ]);
+
+                const summary = await summaryRes.json();
+                const history = await historyRes.json();
+
+                updateStatus(summary);
+                updateCharts(history.events);
+                updateEventsList(history.events);
+                document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+            } catch (err) {
+                console.error('Failed to fetch data:', err);
+            }
+        }
+
+        function updateStatus(summary) {
+            const isOnline = summary.status.is_online;
+            document.getElementById('statusDot').className = 'status-dot ' + (isOnline ? 'online' : 'offline');
+            document.getElementById('statusText').textContent = isOnline ? 'Online' : 'Offline';
+
+            if (summary.status.last_heartbeat_age_seconds) {
+                const age = Math.round(summary.status.last_heartbeat_age_seconds);
+                document.getElementById('lastHeartbeat').textContent = `Last heartbeat: ${age}s ago`;
+            }
+
+            const stats = summary.speed_stats;
+            document.getElementById('avgSpeed').textContent = stats.average ?? '-';
+            document.getElementById('speedRange').textContent = stats.min && stats.max ?
+                `Min: ${stats.min} / Max: ${stats.max} Mbps (${stats.test_count} tests)` : `${stats.test_count} tests`;
+
+            document.getElementById('outageCount').textContent = summary.outage_stats.count;
+            const downtime = summary.outage_stats.total_downtime_seconds;
+            if (downtime > 3600) {
+                document.getElementById('totalDowntime').textContent = `Total downtime: ${(downtime/3600).toFixed(1)}h`;
+            } else if (downtime > 60) {
+                document.getElementById('totalDowntime').textContent = `Total downtime: ${(downtime/60).toFixed(1)}m`;
+            } else {
+                document.getElementById('totalDowntime').textContent = `Total downtime: ${downtime}s`;
+            }
+
+            document.getElementById('latencyCount').textContent = summary.latency_events;
+        }
+
+        function updateCharts(events) {
+            const speedData = [], uploadData = [], latencyData = [];
+
+            events.forEach(e => {
+                const x = new Date(e.timestamp * 1000);
+                if (e.event_type === 'speed_test') {
+                    if (e.data.speed_mbps) speedData.push({ x, y: e.data.speed_mbps });
+                    if (e.data.upload_mbps) uploadData.push({ x, y: e.data.upload_mbps });
+                } else if (e.event_type === 'high_latency' && e.data.ping_ms) {
+                    latencyData.push({ x, y: e.data.ping_ms });
+                }
+            });
+
+            speedChart.data.datasets[0].data = speedData.reverse();
+            speedChart.update();
+
+            uploadChart.data.datasets[0].data = uploadData.reverse();
+            uploadChart.update();
+
+            latencyChart.data.datasets[0].data = latencyData.reverse();
+            latencyChart.update();
+        }
+
+        function updateEventsList(events) {
+            const list = document.getElementById('eventsList');
+            if (!events.length) {
+                list.innerHTML = '<div class="no-data">No events in selected period</div>';
+                return;
+            }
+
+            list.innerHTML = events.slice(0, 50).map(e => {
+                const time = new Date(e.timestamp * 1000).toLocaleString();
+                let detail = '';
+                if (e.event_type === 'speed_test') {
+                    detail = `${e.data.speed_mbps?.toFixed(1) ?? '-'} Mbps`;
+                    if (e.data.upload_mbps) detail += ` / ${e.data.upload_mbps.toFixed(1)} up`;
+                } else if (e.event_type === 'high_latency') {
+                    detail = `${e.data.ping_ms?.toFixed(0) ?? '-'} ms`;
+                } else if (e.event_type === 'restored' || e.event_type === 'outage_end') {
+                    const dur = e.data.duration_seconds;
+                    detail = dur > 60 ? `${(dur/60).toFixed(1)} min` : `${dur?.toFixed(0) ?? '-'}s`;
+                } else if (e.event_type === 'down' || e.event_type === 'outage_start') {
+                    detail = e.data.reason || 'Connection lost';
+                }
+                return `<div class="event-item">
+                    <div><span class="event-type ${e.event_type}">${e.event_type.replace('_', ' ')}</span> ${detail}</div>
+                    <div class="event-time">${time}</div>
+                </div>`;
+            }).join('');
+        }
+
+        document.querySelectorAll('.time-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.time-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                selectedHours = parseInt(btn.dataset.hours);
+                fetchData();
+            });
+        });
+
+        initCharts();
+        fetchData();
+        setInterval(fetchData, 30000);
+    </script>
+</body>
+</html>
+'''
 
 
 @dataclass
@@ -44,6 +421,7 @@ class Config:
     ntfy_topic: str = ''
     outage_log_file: str = './outages.log'
     speedtest_file: str = './speedtest/10MB.bin'
+    database_file: str = './monitor.db'
     # Grace period after startup before sending DOWN notifications
     startup_grace_seconds: int = 120
 
@@ -70,6 +448,7 @@ class Config:
             'NTFY_TOPIC': ('ntfy_topic', str),
             'OUTAGE_LOG_FILE': ('outage_log_file', str),
             'STARTUP_GRACE': ('startup_grace_seconds', int),
+            'DATABASE_FILE': ('database_file', str),
         }
 
         for env_var, (attr, converter) in env_mappings.items():
@@ -81,6 +460,103 @@ class Config:
                     logger.warning(f"Invalid value for {env_var}: {e}")
 
         return config
+
+
+class EventStore:
+    """SQLite-based event storage for dashboard history."""
+
+    def __init__(self, config: Config):
+        self.db_path = Path(config.database_file)
+        self._init_db()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get a database connection (thread-safe)."""
+        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self):
+        """Initialize database tables."""
+        with self._get_connection() as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    datetime TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    source TEXT DEFAULT 'vps'
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_event_type ON events(event_type)')
+            conn.commit()
+
+    def add_event(self, event_type: str, data: dict, source: str = 'vps'):
+        """Add an event to the store."""
+        timestamp = data.get('timestamp', time.time())
+        datetime_str = data.get('datetime_str', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        with self._get_connection() as conn:
+            conn.execute(
+                'INSERT INTO events (timestamp, datetime, event_type, data, source) VALUES (?, ?, ?, ?, ?)',
+                (timestamp, datetime_str, event_type, json.dumps(data), source)
+            )
+            conn.commit()
+
+    def get_events(self, event_type: str = None, hours: int = 24, limit: int = 1000) -> list:
+        """Get events from the store."""
+        cutoff = time.time() - (hours * 3600)
+        with self._get_connection() as conn:
+            if event_type:
+                cursor = conn.execute(
+                    'SELECT * FROM events WHERE event_type = ? AND timestamp > ? ORDER BY timestamp DESC LIMIT ?',
+                    (event_type, cutoff, limit)
+                )
+            else:
+                cursor = conn.execute(
+                    'SELECT * FROM events WHERE timestamp > ? ORDER BY timestamp DESC LIMIT ?',
+                    (cutoff, limit)
+                )
+            rows = cursor.fetchall()
+            return [
+                {
+                    'id': row['id'],
+                    'timestamp': row['timestamp'],
+                    'datetime': row['datetime'],
+                    'event_type': row['event_type'],
+                    'data': json.loads(row['data']),
+                    'source': row['source']
+                }
+                for row in rows
+            ]
+
+    def get_uptime_periods(self, hours: int = 24) -> list:
+        """Get uptime/downtime periods for timeline visualization."""
+        events = self.get_events(hours=hours, limit=5000)
+        # Filter to status change events
+        status_events = [e for e in events if e['event_type'] in ('down', 'restored', 'heartbeat_first')]
+        status_events.sort(key=lambda x: x['timestamp'])
+        return status_events
+
+    def get_speed_tests(self, hours: int = 168) -> list:  # 7 days default
+        """Get speed test results."""
+        return self.get_events(event_type='speed_test', hours=hours)
+
+    def get_latency_events(self, hours: int = 24) -> list:
+        """Get high latency events."""
+        return self.get_events(event_type='high_latency', hours=hours)
+
+    def get_outages(self, hours: int = 168) -> list:  # 7 days default
+        """Get outage events."""
+        events = self.get_events(hours=hours)
+        return [e for e in events if e['event_type'] in ('outage_start', 'outage_end', 'down', 'restored')]
+
+    def cleanup_old_events(self, days: int = 30):
+        """Delete events older than specified days."""
+        cutoff = time.time() - (days * 86400)
+        with self._get_connection() as conn:
+            conn.execute('DELETE FROM events WHERE timestamp < ?', (cutoff,))
+            conn.commit()
 
 
 class HeartbeatTracker:
@@ -265,6 +741,7 @@ class VPSMonitor:
         self.tracker = HeartbeatTracker(config)
         self.notifier = NtfyNotifier(config)
         self.outage_logger = OutageLogger(config)
+        self.event_store = EventStore(config)
 
         self.app = Flask(__name__)
         self._setup_routes()
@@ -293,6 +770,11 @@ class VPSMonitor:
                         'type': 'restored',
                         'duration_seconds': duration
                     })
+                    self.event_store.add_event('restored', {
+                        'timestamp': time.time(),
+                        'datetime_str': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'duration_seconds': duration
+                    }, source='vps')
                 else:
                     logger.debug(f"Heartbeat received from {request.remote_addr}")
 
@@ -315,12 +797,86 @@ class VPSMonitor:
                     'type': 'nas_report',
                     'data': data
                 })
+                self.event_store.add_event('outage_report', data, source='nas')
 
                 return jsonify({'status': 'ok'})
 
             except Exception as e:
                 logger.error(f"Error processing outage report: {e}")
                 return jsonify({'status': 'error', 'message': str(e)}), 500
+
+        @self.app.route('/api/events', methods=['POST'])
+        def receive_events():
+            """Receive events from NAS (speed tests, latency, etc)."""
+            try:
+                data = request.get_json() or {}
+                event_type = data.get('event_type', 'unknown')
+                event_data = data.get('data', {})
+                event_data['received_at'] = time.time()
+
+                self.event_store.add_event(event_type, event_data, source='nas')
+                logger.debug(f"Event received from NAS: {event_type}")
+
+                return jsonify({'status': 'ok'})
+            except Exception as e:
+                logger.error(f"Error receiving event: {e}")
+                return jsonify({'status': 'error', 'message': str(e)}), 500
+
+        @self.app.route('/api/history', methods=['GET'])
+        def get_history():
+            """Get event history for dashboard."""
+            hours = request.args.get('hours', 168, type=int)  # 7 days default
+            event_type = request.args.get('type', None)
+
+            if event_type:
+                events = self.event_store.get_events(event_type=event_type, hours=hours)
+            else:
+                events = self.event_store.get_events(hours=hours)
+
+            return jsonify({
+                'events': events,
+                'count': len(events),
+                'hours': hours
+            })
+
+        @self.app.route('/api/summary', methods=['GET'])
+        def get_summary():
+            """Get summary data for dashboard."""
+            hours = request.args.get('hours', 24, type=int)
+
+            speed_tests = self.event_store.get_speed_tests(hours=hours)
+            outages = self.event_store.get_outages(hours=hours)
+            latency_events = self.event_store.get_latency_events(hours=hours)
+            status = self.tracker.get_status()
+
+            # Calculate stats
+            speeds = [e['data'].get('speed_mbps') for e in speed_tests if e['data'].get('speed_mbps')]
+            avg_speed = sum(speeds) / len(speeds) if speeds else None
+            min_speed = min(speeds) if speeds else None
+            max_speed = max(speeds) if speeds else None
+
+            outage_count = len([e for e in outages if e['event_type'] in ('outage_start', 'down')])
+            total_downtime = sum(
+                e['data'].get('duration_seconds', 0)
+                for e in outages
+                if e['event_type'] in ('outage_end', 'restored', 'outage_report')
+            )
+
+            return jsonify({
+                'status': status,
+                'speed_stats': {
+                    'average': round(avg_speed, 1) if avg_speed else None,
+                    'min': round(min_speed, 1) if min_speed else None,
+                    'max': round(max_speed, 1) if max_speed else None,
+                    'test_count': len(speed_tests)
+                },
+                'outage_stats': {
+                    'count': outage_count,
+                    'total_downtime_seconds': total_downtime
+                },
+                'latency_events': len(latency_events),
+                'hours': hours
+            })
 
         @self.app.route('/status', methods=['GET'])
         def status():
@@ -331,6 +887,12 @@ class VPSMonitor:
         def health():
             """Health check endpoint."""
             return jsonify({'status': 'healthy', 'timestamp': time.time()})
+
+        @self.app.route('/', methods=['GET'])
+        @self.app.route('/dashboard', methods=['GET'])
+        def dashboard():
+            """Serve the dashboard HTML."""
+            return Response(DASHBOARD_HTML, mimetype='text/html')
 
         @self.app.route('/speedtest', methods=['GET'])
         def speedtest():
@@ -359,6 +921,11 @@ class VPSMonitor:
                             'type': 'down_detected',
                             'reason': reason
                         })
+                        self.event_store.add_event('down', {
+                            'timestamp': time.time(),
+                            'datetime_str': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            'reason': reason
+                        }, source='vps')
             except Exception as e:
                 logger.error(f"Error in check loop: {e}")
 

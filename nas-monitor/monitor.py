@@ -474,6 +474,21 @@ class VPSClient:
         except requests.RequestException:
             return False
 
+    def send_event(self, event_type: str, data: dict) -> bool:
+        """Send an event to the VPS for dashboard history."""
+        try:
+            response = self.session.post(
+                f"{self.config.vps_url}/api/events",
+                json={
+                    'event_type': event_type,
+                    'data': data
+                },
+                timeout=10
+            )
+            return response.status_code == 200
+        except requests.RequestException:
+            return False
+
 
 class InternetMonitor:
     """Main monitor orchestrating all components."""
@@ -498,6 +513,11 @@ class InternetMonitor:
 
         self._shutdown_event = threading.Event()
 
+    def _log_and_forward(self, event_type: str, data: dict):
+        """Log event locally and forward to VPS for dashboard."""
+        self.event_logger.log_event(event_type, data)
+        self.vps_client.send_event(event_type, data)
+
     def request_speed_test(self, use_ookla: bool = False) -> Optional[SpeedTestResult]:
         """Trigger a manual speed test."""
         if use_ookla:
@@ -515,7 +535,7 @@ class InternetMonitor:
             }
             if result.upload_mbps is not None:
                 log_data['upload_mbps'] = result.upload_mbps
-            self.event_logger.log_event('speed_test', log_data)
+            self._log_and_forward('speed_test', log_data)
             self.notifier.notify_speed_test(result)
             self._check_slow_speed(result)
         return result
@@ -529,7 +549,7 @@ class InternetMonitor:
         vps_result = self.speed_tester.run_test(trigger='manual_full')
         if vps_result:
             results['vps_download_mbps'] = vps_result.speed_mbps
-            self.event_logger.log_event('speed_test', {
+            self._log_and_forward('speed_test', {
                 'timestamp': vps_result.timestamp,
                 'datetime_str': vps_result.datetime_str,
                 'speed_mbps': vps_result.speed_mbps,
@@ -542,7 +562,7 @@ class InternetMonitor:
         if ookla_result:
             results['ookla_download_mbps'] = ookla_result.speed_mbps
             results['ookla_upload_mbps'] = ookla_result.upload_mbps
-            self.event_logger.log_event('speed_test', {
+            self._log_and_forward('speed_test', {
                 'timestamp': ookla_result.timestamp,
                 'datetime_str': ookla_result.datetime_str,
                 'speed_mbps': ookla_result.speed_mbps,
@@ -621,10 +641,11 @@ class InternetMonitor:
                 confirmed_slow = ookla_result.speed_mbps < self.config.slow_speed_threshold_mbps
 
                 # Log both results
-                self.event_logger.log_event('speed_test', {
+                self._log_and_forward('speed_test', {
                     'timestamp': result.timestamp,
                     'datetime_str': result.datetime_str,
                     'vps_speed_mbps': vps_speed,
+                    'speed_mbps': ookla_result.speed_mbps,
                     'ookla_speed_mbps': ookla_result.speed_mbps,
                     'upload_mbps': ookla_result.upload_mbps,
                     'trigger': trigger,
@@ -645,7 +666,7 @@ class InternetMonitor:
 
         # Normal path: VPS test was fine, or Ookla not available
         if not only_log_if_slow or is_slow:
-            self.event_logger.log_event('speed_test', {
+            self._log_and_forward('speed_test', {
                 'timestamp': result.timestamp,
                 'datetime_str': result.datetime_str,
                 'speed_mbps': result.speed_mbps,
@@ -666,7 +687,7 @@ class InternetMonitor:
             # Outage started
             self.current_outage = OutageEvent(start_time=result.timestamp, start_datetime=result.datetime_str)
             logger.warning(f"OUTAGE DETECTED at {result.datetime_str}")
-            self.event_logger.log_event('outage_start', {
+            self._log_and_forward('outage_start', {
                 'timestamp': result.timestamp,
                 'datetime_str': result.datetime_str
             })
@@ -680,7 +701,7 @@ class InternetMonitor:
                 self.current_outage.duration_seconds = result.timestamp - self.current_outage.start_time
                 duration_min = self.current_outage.duration_seconds / 60
                 logger.info(f"OUTAGE ENDED at {result.datetime_str} (duration: {duration_min:.1f} minutes)")
-                self.event_logger.log_event('outage_end', {
+                self._log_and_forward('outage_end', {
                     'timestamp': result.timestamp,
                     'datetime_str': result.datetime_str,
                     'duration_seconds': self.current_outage.duration_seconds
@@ -746,7 +767,7 @@ class InternetMonitor:
                 if result.status == 'online' and result.ping_ms:
                     if result.ping_ms > self.config.high_latency_threshold_ms:
                         logger.warning(f"High latency: {result.ping_ms:.1f}ms")
-                        self.event_logger.log_event('high_latency', {
+                        self._log_and_forward('high_latency', {
                             'timestamp': result.timestamp,
                             'datetime_str': result.datetime_str,
                             'ping_ms': result.ping_ms
