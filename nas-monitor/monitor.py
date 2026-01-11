@@ -787,6 +787,14 @@ class InternetMonitor:
                 time_since_scheduled = time.time() - self.last_scheduled_test_time
                 if time_since_scheduled >= self.config.scheduled_speed_test_interval_seconds:
                     self.last_scheduled_test_time = time.time()
+                    # Log hourly latency sample for dashboard graph
+                    if result.status == 'online' and result.ping_ms:
+                        self._log_and_forward('latency', {
+                            'timestamp': result.timestamp,
+                            'datetime_str': result.datetime_str,
+                            'ping_ms': result.ping_ms,
+                            'trigger': 'scheduled'
+                        })
                     self._maybe_run_speed_test('scheduled', only_log_if_slow=False)
 
                 # Log status (only on change or hourly)
