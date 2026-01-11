@@ -672,7 +672,9 @@ class InternetMonitor:
                 'speed_mbps': result.speed_mbps,
                 'trigger': result.trigger
             })
-            self.notifier.notify_speed_test(result)
+            # Only notify for manual tests or when slow (not for routine scheduled tests)
+            if trigger == 'manual' or is_slow:
+                self.notifier.notify_speed_test(result)
         else:
             logger.debug(f"Scheduled speed test: {result.speed_mbps:.1f} Mbps (OK, not logged)")
 
