@@ -64,13 +64,85 @@ vps-monitor/
   vps-monitor.service # Systemd unit
 ```
 
-## Deployment Notes
+## Production Deployment
 
-Both services use systemd with:
-- `After=tailscaled.service` dependency
-- Security hardening (NoNewPrivileges, ProtectSystem)
-- Auto-restart on failure
-- Journal logging (view with `journalctl -u vps-monitor -f`)
+### NAS (QNAP TS-453be)
+
+- **Tailscale IP**: 100.66.41.139
+- **User**: admin
+- **Deployment**: Docker container (via Container Station)
+- **Docker binary**: `/share/CACHEDEV3_DATA/.qpkg/container-station/usr/bin/docker`
+- **Compose files**: `/share/Container/nas-monitor/` (copied by update script)
+- **Logs volume**: `/share/Container/nas-monitor/logs/`
+- **HTTP port**: 8090 (for speed test triggers)
+- **Network mode**: host (required for ping and Tailscale access)
+
+**Important**: Docker is NOT in PATH on QNAP. Always use full path.
+
+**SSH Note**: QNAP has a menu on SSH login. Bypass by passing command directly:
+```bash
+ssh admin@100.66.41.139 /bin/bash -c "'command here'"
+```
+
+**Container env vars** (set in docker-compose.override.yml, gitignored):
+- VPS_URL=http://100.89.202.1:5000
+- NTFY_TOPIC=jowtron-home-network
+- HTTP_PORT=8090
+
+### VPS (Debian)
+
+- **Tailscale IP**: 100.89.202.1
+- **User**: root
+- **Two separate services**:
+  1. `vps-heartbeat` (port 5000) - Internet monitor from this repo
+     - Path: `/opt/internet-monitor/vps-monitor/`
+     - Service: `vps-heartbeat.service`
+     - Has SQLite DB for event history
+  2. `vps-monitor` (port 8085) - VPS stats dashboard (separate project)
+     - Path: `/root/vps-monitor/`
+     - Service: `vps-monitor.service`
+     - Proxies to port 5000 for `/monitor/internet/*` routes
+
+### Tailscale Serve Routes
+
+```
+https://incrediblepbx.merino-komodo.ts.net
+├── /                  → http://127.0.0.1:80
+├── /monitor           → http://127.0.0.1:8085 (VPS stats + Home Internet summary)
+└── /monitor/internet  → http://127.0.0.1:5000 (detailed internet dashboard)
+```
+
+### Dashboard URLs
+
+- **Main dashboard**: https://incrediblepbx.merino-komodo.ts.net/monitor/
+- **Internet details**: https://incrediblepbx.merino-komodo.ts.net/monitor/internet
+- **Direct VPS stats**: http://100.89.202.1:8085
+- **Direct internet API**: http://100.89.202.1:5000
+
+### Updating
+
+**NAS** (from laptop):
+```bash
+cd nas-monitor && ./update-nas.sh
+```
+
+**VPS**:
+```bash
+ssh root@100.89.202.1 'cd /opt/internet-monitor && git pull && systemctl restart vps-heartbeat'
+```
+
+### Checking Logs
+
+```bash
+# NAS container logs
+ssh admin@100.66.41.139 '/share/CACHEDEV3_DATA/.qpkg/container-station/usr/bin/docker logs nas-monitor -f'
+
+# VPS heartbeat service
+ssh root@100.89.202.1 'journalctl -u vps-heartbeat -f'
+
+# VPS stats dashboard
+ssh root@100.89.202.1 'journalctl -u vps-monitor -f'
+```
 
 ## Common Modifications
 

@@ -781,11 +781,11 @@ class InternetMonitor:
                     if time_since_test >= self.config.slow_speed_test_interval_seconds:
                         self._maybe_run_speed_test('slow_speed_retest')
 
-                # Scheduled hourly speed test (only log if slow)
+                # Scheduled hourly speed test (always log to dashboard, notify only if slow)
                 time_since_scheduled = time.time() - self.last_scheduled_test_time
                 if time_since_scheduled >= self.config.scheduled_speed_test_interval_seconds:
                     self.last_scheduled_test_time = time.time()
-                    self._maybe_run_speed_test('scheduled', only_log_if_slow=True)
+                    self._maybe_run_speed_test('scheduled', only_log_if_slow=False)
 
                 # Log status (only on change or hourly)
                 if status_changed:
