@@ -96,12 +96,54 @@ sudo systemctl enable --now nas-monitor
 
 Install ntfy app on your phone and subscribe to your topic.
 
+## Speed Tests
+
+### Test Methods
+
+| Method | Duration | What it measures |
+|--------|----------|------------------|
+| **VPS Quick Test** | ~2-3 sec | Downloads 10MB from VPS, estimates speed |
+| **Ookla Test** | ~30-60 sec | Full Ookla CLI test, accurate download + upload |
+
+### Triggers
+
+| Trigger | Method | Notifies | Logged to Dashboard |
+|---------|--------|----------|---------------------|
+| `manual` | VPS (or Ookla if requested) | Always | Yes |
+| `scheduled` | VPS hourly | Only if slow | Yes |
+| `high_latency` | VPS → Ookla if slow | Only if confirmed slow | Yes |
+| `post_outage` | VPS → Ookla if slow | Only if confirmed slow | Yes |
+| `slow_speed_retest` | VPS → Ookla | Only if confirmed slow | Yes |
+
+### Triage System
+
+Automatic speed tests use a two-stage check to avoid false alarms:
+
+1. **Quick VPS test** (10MB download, ~2 sec)
+2. **If VPS < 50 Mbps** → Ookla runs to confirm
+
+Notifications are only sent when speed is **confirmed slow** by both tests.
+
+### Manual Speed Tests
+
+```bash
+# Quick VPS test (~2 sec)
+curl -X POST http://<NAS_IP>:8090/speedtest
+
+# Ookla test (~30-60 sec)
+curl -X POST http://<NAS_IP>:8090/speedtest/ookla
+
+# Full suite: VPS + Ookla
+curl -X POST http://<NAS_IP>:8090/speedtest/full
+```
+
 ## Notifications
 
 | Notification | When | Priority |
 |--------------|------|----------|
 | Home Network DOWN | No heartbeat for 3 minutes | High |
 | Home Network RESTORED | Heartbeat received after outage | Normal |
+| Speed Test (Confirmed Slow) | Both VPS and Ookla < 50 Mbps | High |
 
 ## CSV Log Format
 
