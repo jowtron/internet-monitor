@@ -747,7 +747,7 @@ class InternetMonitor:
         logger.info(f"VPS URL: {self.config.vps_url}")
         logger.info(f"High latency threshold: {self.config.high_latency_threshold_ms}ms")
         logger.info(f"Slow speed threshold: {self.config.slow_speed_threshold_mbps} Mbps")
-        logger.info(f"Scheduled speed test: every {self.config.scheduled_speed_test_interval_seconds}s (log only if slow)")
+        logger.info(f"Scheduled speed test: every {self.config.scheduled_speed_test_interval_seconds}s (always logged)")
         logger.info(f"HTTP server port: {self.config.http_port}")
 
         self._maybe_send_heartbeat()
