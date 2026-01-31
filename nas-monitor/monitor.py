@@ -443,12 +443,34 @@ class VPSClient:
         self.config = config
         self.session = requests.Session()
 
+    def _get_boot_id(self) -> str:
+        """Get the Linux boot ID (changes on every reboot)."""
+        try:
+            with open('/proc/sys/kernel/random/boot_id', 'r') as f:
+                return f.read().strip()
+        except Exception:
+            return ''
+
+    def _get_uptime_seconds(self) -> float:
+        """Get system uptime in seconds."""
+        try:
+            with open('/proc/uptime', 'r') as f:
+                return float(f.read().split()[0])
+        except Exception:
+            return 0.0
+
     def send_heartbeat(self) -> bool:
         """Send a heartbeat to the VPS."""
         try:
             response = self.session.post(
                 f"{self.config.vps_url}/heartbeat",
-                json={'timestamp': time.time(), 'datetime': datetime.now().isoformat(), 'source': 'nas-monitor'},
+                json={
+                    'timestamp': time.time(),
+                    'datetime': datetime.now().isoformat(),
+                    'source': 'nas-monitor',
+                    'boot_id': self._get_boot_id(),
+                    'uptime_seconds': self._get_uptime_seconds(),
+                },
                 timeout=10
             )
             return response.status_code == 200

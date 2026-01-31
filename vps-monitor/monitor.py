@@ -40,6 +40,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Internet Monitor Dashboard</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect fill='%230f0f0f' width='100' height='100' rx='20'/><path d='M25 65 L40 40 L55 55 L75 25' stroke='%234ade80' stroke-width='8' fill='none' stroke-linecap='round' stroke-linejoin='round'/><circle cx='75' cy='25' r='6' fill='%234ade80'/></svg>">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
     <style>
@@ -161,6 +162,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         }
         .event-type.speed_test { background: #3b82f6; }
         .event-type.high_latency { background: #f59e0b; }
+        .event-type.latency { background: #06b6d4; }
         .event-type.down, .event-type.outage_start { background: #ef4444; }
         .event-type.restored, .event-type.outage_end { background: #22c55e; }
         .event-time { color: #64748b; font-size: 0.875rem; }
@@ -169,6 +171,36 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             text-align: center;
             padding: 40px;
         }
+        .incidents-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .incidents-table th {
+            text-align: left;
+            padding: 8px 10px;
+            border-bottom: 2px solid #334155;
+            color: #94a3b8;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .incidents-table td {
+            padding: 8px 10px;
+            border-bottom: 1px solid #334155;
+            font-size: 0.875rem;
+        }
+        .incidents-table tr:last-child td { border-bottom: none; }
+        .badge {
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            display: inline-block;
+        }
+        .badge.outage { background: #ef4444; color: white; }
+        .badge.slow { background: #f59e0b; color: white; }
+        .badge.pass { background: #22c55e; color: white; }
+        .badge.fail { background: #ef4444; color: white; }
         .refresh-info {
             text-align: right;
             font-size: 0.75rem;
@@ -179,10 +211,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 </head>
 <body>
     <div class="container">
-        <h1>
-            <span class="status-dot" id="statusDot"></span>
-            Internet Monitor
-        </h1>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+            <a href="/monitor" style="color:#64748b;text-decoration:none;font-size:0.9rem;">&larr; Back to VPS Monitor</a>
+            <h1 style="margin:0;">
+                <span class="status-dot" id="statusDot"></span>
+                Internet Monitor
+            </h1>
+            <button id="speedTestBtn" onclick="triggerSpeedTest()" style="background:#3b82f6;color:white;border:none;padding:8px 16px;border-radius:8px;cursor:pointer;font-size:0.9rem;">Run Speed Test</button>
+        </div>
 
         <div class="refresh-info">Auto-refreshes every 30 seconds | Last update: <span id="lastUpdate">-</span></div>
 
@@ -192,6 +228,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             <button class="time-btn active" data-hours="24">24h</button>
             <button class="time-btn" data-hours="168">7d</button>
             <button class="time-btn" data-hours="720">30d</button>
+            <button class="time-btn" data-hours="4380">6mo</button>
+            <button class="time-btn" data-hours="8760">12mo</button>
         </div>
 
         <div class="grid">
@@ -245,11 +283,19 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="no-data">No events yet</div>
             </div>
         </div>
+
+        <div class="chart-container">
+            <h2>Incidents</h2>
+            <div id="incidentsList" style="max-height:400px;overflow-y:auto;">
+                <div class="no-data">No incidents yet</div>
+            </div>
+        </div>
     </div>
 
     <script>
         let speedChart, uploadChart, latencyChart;
         let selectedHours = 24;
+        const basePath = window.location.pathname.replace(/\/$/, '') || '';
 
         const chartOptions = {
             responsive: true,
@@ -297,8 +343,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         async function fetchData() {
             try {
                 const [summaryRes, historyRes] = await Promise.all([
-                    fetch(`/api/summary?hours=${selectedHours}`),
-                    fetch(`/api/history?hours=${selectedHours}`)
+                    fetch(`${basePath}/api/summary?hours=${selectedHours}`),
+                    fetch(`${basePath}/api/history?hours=${selectedHours}`)
                 ]);
 
                 const summary = await summaryRes.json();
@@ -349,7 +395,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 if (e.event_type === 'speed_test') {
                     if (e.data.speed_mbps) speedData.push({ x, y: e.data.speed_mbps });
                     if (e.data.upload_mbps) uploadData.push({ x, y: e.data.upload_mbps });
-                } else if (e.event_type === 'high_latency' && e.data.ping_ms) {
+                } else if ((e.event_type === 'high_latency' || e.event_type === 'latency') && e.data.ping_ms) {
                     latencyData.push({ x, y: e.data.ping_ms });
                 }
             });
@@ -375,9 +421,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 const time = new Date(e.timestamp * 1000).toLocaleString();
                 let detail = '';
                 if (e.event_type === 'speed_test') {
-                    detail = `${e.data.speed_mbps?.toFixed(1) ?? '-'} Mbps`;
-                    if (e.data.upload_mbps) detail += ` / ${e.data.upload_mbps.toFixed(1)} up`;
-                } else if (e.event_type === 'high_latency') {
+                    const testType = e.data.test_type || (e.data.ookla_speed_mbps ? 'ookla' : 'vps'); const trigger = e.data.trigger || '?'; detail = `${e.data.speed_mbps?.toFixed(1) ?? '-'} Mbps`;
+                    if (e.data.upload_mbps) detail += ` ↑${e.data.upload_mbps.toFixed(1)}`;
+                    detail += ` <span style="opacity:0.6;font-size:0.75em">[${testType}/${trigger}]</span>`;
+                } else if (e.event_type === 'high_latency' || e.event_type === 'latency') {
                     detail = `${e.data.ping_ms?.toFixed(0) ?? '-'} ms`;
                 } else if (e.event_type === 'restored' || e.event_type === 'outage_end') {
                     const dur = e.data.duration_seconds;
@@ -398,12 +445,100 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 btn.classList.add('active');
                 selectedHours = parseInt(btn.dataset.hours);
                 fetchData();
+                fetchIncidents();
             });
         });
 
+        
+        async function triggerSpeedTest() {
+            const btn = document.getElementById('speedTestBtn');
+            const origText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Running...';
+            btn.style.background = '#64748b';
+            try {
+                const resp = await fetch(basePath + '/trigger-speedtest?type=ookla', {method: 'POST'});
+                const data = await resp.json();
+                if (data.error) {
+                    alert('Speed test failed: ' + data.error);
+                } else {
+                    const speed = data.download_mbps || data.speed_mbps || '--';
+                    alert('Speed test complete! Download: ' + speed + ' Mbps');
+                    fetchData();
+                }
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+            btn.disabled = false;
+            btn.textContent = origText;
+            btn.style.background = '#3b82f6';
+        }
+
+        async function fetchIncidents() {
+            try {
+                const res = await fetch(`${basePath}/api/incidents?hours=${selectedHours}`);
+                const data = await res.json();
+                const container = document.getElementById('incidentsList');
+                if (!data.incidents || !data.incidents.length) {
+                    container.innerHTML = '<div class="no-data">No incidents in selected period</div>';
+                    return;
+                }
+                let html = '<table class="incidents-table"><thead><tr><th>Time</th><th>Type</th><th>Cause</th><th>Details</th><th>Retest</th><th>Resolved</th></tr></thead><tbody>';
+                data.incidents.forEach(inc => {
+                    const time = new Date(inc.timestamp * 1000).toLocaleString();
+                    let typeBadge, cause, details, retest, resolved;
+
+                    // Determine cause display
+                    if (inc.cause === 'power_cut') {
+                        cause = '<span class="badge" style="background:#a855f7">power cut</span>';
+                    } else if (inc.cause === 'isp_issue') {
+                        cause = '<span class="badge" style="background:#3b82f6">ISP issue</span>';
+                    } else if (inc.type === 'slow_speed') {
+                        cause = '<span style="color:#64748b">—</span>';
+                    } else {
+                        cause = '<span style="color:#64748b">unknown</span>';
+                    }
+
+                    if (inc.merged) {
+                        typeBadge = '<span class="badge outage">outage</span>';
+                        details = inc.summary;
+                        retest = '<span style="color:#64748b">' + inc.sub_count + ' events</span>';
+                        resolved = inc.resolved_at ? new Date(inc.resolved_at * 1000).toLocaleString() : '<span style="color:#ef4444">ongoing</span>';
+                    } else if (inc.type === 'outage') {
+                        typeBadge = '<span class="badge outage">outage</span>';
+                        const dur = inc.duration_seconds;
+                        if (dur > 3600) details = (dur/3600).toFixed(1) + 'h down';
+                        else if (dur > 60) details = (dur/60).toFixed(1) + 'm down';
+                        else details = (dur || 0).toFixed(0) + 's down';
+                        retest = '<span style="color:#64748b">N/A</span>';
+                        resolved = inc.resolved_at ? new Date(inc.resolved_at * 1000).toLocaleString() : '<span style="color:#ef4444">ongoing</span>';
+                    } else {
+                        typeBadge = '<span class="badge slow">slow speed</span>';
+                        details = (inc.speed_mbps || 0).toFixed(1) + ' Mbps';
+                        if (inc.trigger) details += ' <span style="opacity:0.6;font-size:0.8em">[' + inc.trigger + ']</span>';
+                        if (inc.retest) {
+                            const cls = inc.retest.passed ? 'pass' : 'fail';
+                            const label = inc.retest.passed ? 'PASS' : 'FAIL';
+                            retest = '<span class="badge ' + cls + '">' + label + '</span> ' + (inc.retest.speed_mbps || 0).toFixed(1) + ' Mbps';
+                            resolved = inc.retest.passed ? new Date(inc.retest.timestamp * 1000).toLocaleString() : '<span style="color:#ef4444">not resolved</span>';
+                        } else {
+                            retest = '<span style="color:#64748b">no retest</span>';
+                            resolved = inc.resolved_at ? new Date(inc.resolved_at * 1000).toLocaleString() : '<span style="color:#64748b">unknown</span>';
+                        }
+                    }
+                    html += '<tr><td>' + time + '</td><td>' + typeBadge + '</td><td>' + cause + '</td><td>' + details + '</td><td>' + retest + '</td><td>' + resolved + '</td></tr>';
+                });
+                html += '</tbody></table>';
+                container.innerHTML = html;
+            } catch (err) {
+                console.error('Failed to fetch incidents:', err);
+            }
+        }
+
         initCharts();
         fetchData();
-        setInterval(fetchData, 30000);
+        fetchIncidents();
+        setInterval(() => { fetchData(); fetchIncidents(); }, 30000);
     </script>
 </body>
 </html>
@@ -570,12 +705,17 @@ class HeartbeatTracker:
         self.outage_start_time: Optional[float] = None
         self.startup_time = time.time()
         self._lock = threading.Lock()
+        # Track boot_id to detect NAS reboots (power cuts)
+        self.last_boot_id: Optional[str] = None
+        self.boot_id_before_outage: Optional[str] = None
 
     def record_heartbeat(self, data: dict):
         """Record a received heartbeat."""
         with self._lock:
             now = time.time()
             was_offline = not self.is_online
+            new_boot_id = data.get('boot_id', '')
+            new_uptime = data.get('uptime_seconds', 0)
 
             self.last_heartbeat_time = now
             self.last_heartbeat_data = data
@@ -585,10 +725,25 @@ class HeartbeatTracker:
                 # Calculate outage duration
                 duration = now - self.outage_start_time
                 self.outage_start_time = None
+
+                # Detect if NAS rebooted during outage
+                nas_rebooted = False
+                if self.boot_id_before_outage and new_boot_id:
+                    nas_rebooted = (new_boot_id != self.boot_id_before_outage)
+
+                self.last_boot_id = new_boot_id
+                self.boot_id_before_outage = None
+
                 return {
                     'event': 'restored',
-                    'duration_seconds': duration
+                    'duration_seconds': duration,
+                    'nas_rebooted': nas_rebooted,
+                    'boot_id': new_boot_id,
+                    'uptime_seconds': new_uptime,
                 }
+
+            # Update boot_id tracking
+            self.last_boot_id = new_boot_id
             return {'event': 'heartbeat'}
 
     def check_status(self) -> Optional[dict]:
@@ -605,6 +760,7 @@ class HeartbeatTracker:
                 if self.is_online:
                     self.is_online = False
                     self.outage_start_time = now
+                    self.boot_id_before_outage = self.last_boot_id
                     return {'event': 'down', 'reason': 'no_heartbeat_received'}
                 return None
 
@@ -614,6 +770,7 @@ class HeartbeatTracker:
                 if self.is_online:
                     self.is_online = False
                     self.outage_start_time = self.last_heartbeat_time
+                    self.boot_id_before_outage = self.last_boot_id
                     return {
                         'event': 'down',
                         'reason': 'heartbeat_timeout',
@@ -764,16 +921,22 @@ class VPSMonitor:
 
                 if result.get('event') == 'restored':
                     duration = result['duration_seconds']
-                    logger.info(f"Home network RESTORED after {duration:.1f}s")
+                    nas_rebooted = result.get('nas_rebooted', False)
+                    cause = 'power_cut' if nas_rebooted else 'isp_issue'
+                    logger.info(f"Home network RESTORED after {duration:.1f}s (cause: {cause})")
                     self.notifier.notify_restored(duration)
                     self.outage_logger.log_outage({
                         'type': 'restored',
-                        'duration_seconds': duration
+                        'duration_seconds': duration,
+                        'nas_rebooted': nas_rebooted,
                     })
                     self.event_store.add_event('restored', {
                         'timestamp': time.time(),
                         'datetime_str': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'duration_seconds': duration
+                        'duration_seconds': duration,
+                        'nas_rebooted': nas_rebooted,
+                        'boot_id': result.get('boot_id', ''),
+                        'uptime_seconds': result.get('uptime_seconds', 0),
                     }, source='vps')
                 else:
                     logger.debug(f"Heartbeat received from {request.remote_addr}")
@@ -878,6 +1041,166 @@ class VPSMonitor:
                 'hours': hours
             })
 
+        @self.app.route('/api/incidents', methods=['GET'])
+        def get_incidents():
+            """Get incident list (outages + slow speed tests) for dashboard."""
+            hours = request.args.get('hours', 24, type=int)
+            events = self.event_store.get_events(hours=hours)
+
+            raw_incidents = []
+
+            # Collect outage incidents (pair down + restored)
+            down_events = [e for e in events if e['event_type'] in ('down', 'outage_start')]
+            restored_events = [e for e in events if e['event_type'] in ('restored', 'outage_end')]
+            restored_events.sort(key=lambda x: x['timestamp'])
+
+            for de in down_events:
+                restored = None
+                for re in restored_events:
+                    if re['timestamp'] > de['timestamp']:
+                        restored = re
+                        break
+                duration = restored['data'].get('duration_seconds', 0) if restored else None
+                resolved_at = restored['timestamp'] if restored else None
+                nas_rebooted = restored['data'].get('nas_rebooted') if restored else None
+                # Determine cause: power_cut if NAS rebooted, isp_issue if not, unknown if no data
+                if nas_rebooted is True:
+                    cause = 'power_cut'
+                elif nas_rebooted is False:
+                    cause = 'isp_issue'
+                else:
+                    cause = 'unknown'
+                raw_incidents.append({
+                    'type': 'outage',
+                    'timestamp': de['timestamp'],
+                    'datetime': de['datetime'],
+                    'duration_seconds': duration,
+                    'reason': de['data'].get('reason', 'Connection lost'),
+                    'resolved_at': resolved_at,
+                    'cause': cause,
+                    'nas_rebooted': nas_rebooted,
+                })
+
+            # Collect slow speed test incidents (speed_mbps < 50)
+            speed_tests = [e for e in events if e['event_type'] == 'speed_test']
+            speed_tests.sort(key=lambda x: x['timestamp'])
+
+            for i, st in enumerate(speed_tests):
+                speed = st['data'].get('speed_mbps')
+                if speed is None or speed >= 50:
+                    continue
+                trigger = st['data'].get('trigger', '')
+                if trigger == 'slow_speed_retest':
+                    continue
+
+                incident = {
+                    'type': 'slow_speed',
+                    'timestamp': st['timestamp'],
+                    'datetime': st['datetime'],
+                    'speed_mbps': speed,
+                    'trigger': trigger,
+                    'retest': None,
+                }
+
+                for j in range(i + 1, len(speed_tests)):
+                    candidate = speed_tests[j]
+                    dt = candidate['timestamp'] - st['timestamp']
+                    if dt > 900:
+                        break
+                    if candidate['data'].get('trigger') == 'slow_speed_retest':
+                        retest_speed = candidate['data'].get('speed_mbps', 0)
+                        incident['retest'] = {
+                            'speed_mbps': retest_speed,
+                            'passed': retest_speed >= 50,
+                            'timestamp': candidate['timestamp'],
+                        }
+                        break
+
+                raw_incidents.append(incident)
+
+            # Sort chronologically for grouping
+            raw_incidents.sort(key=lambda x: x['timestamp'])
+
+            # Group incidents within 30 min of each other into single events
+            MERGE_GAP = 1800  # 30 minutes
+            groups = []
+            for inc in raw_incidents:
+                if groups:
+                    last = groups[-1]
+                    last_end = last['resolved_at'] or last['sub_incidents'][-1]['timestamp']
+                    if inc['timestamp'] - last_end <= MERGE_GAP:
+                        last['sub_incidents'].append(inc)
+                        # Update resolved_at to latest
+                        inc_end = inc.get('resolved_at') or (inc.get('retest', {}) or {}).get('timestamp')
+                        if inc_end and (last['resolved_at'] is None or inc_end > last['resolved_at']):
+                            last['resolved_at'] = inc_end
+                        continue
+                # Start new group
+                resolved = inc.get('resolved_at') or (inc.get('retest', {}) or {}).get('timestamp')
+                groups.append({
+                    'resolved_at': resolved,
+                    'sub_incidents': [inc],
+                })
+
+            # Build final incident list from groups
+            incidents = []
+            for g in groups:
+                subs = g['sub_incidents']
+                outages = [s for s in subs if s['type'] == 'outage']
+                slows = [s for s in subs if s['type'] == 'slow_speed']
+                total_downtime = sum(s.get('duration_seconds') or 0 for s in outages)
+
+                if len(subs) == 1:
+                    # Single incident, pass through as-is with resolved_at
+                    entry = dict(subs[0])
+                    if entry['type'] == 'slow_speed' and entry.get('retest') and entry['retest'].get('passed'):
+                        entry['resolved_at'] = entry['retest']['timestamp']
+                    elif entry['type'] == 'slow_speed':
+                        entry['resolved_at'] = None
+                    incidents.append(entry)
+                else:
+                    # Merged group
+                    parts = []
+                    if outages:
+                        parts.append(f"{len(outages)} outage{'s' if len(outages) != 1 else ''}")
+                    if slows:
+                        parts.append(f"{len(slows)} slow test{'s' if len(slows) != 1 else ''}")
+                    summary = ', '.join(parts)
+
+                    if total_downtime > 3600:
+                        summary += f" — {total_downtime/3600:.1f}h total downtime"
+                    elif total_downtime > 60:
+                        summary += f" — {total_downtime/60:.1f}m total downtime"
+                    elif total_downtime > 0:
+                        summary += f" — {total_downtime:.0f}s total downtime"
+
+                    # Determine cause for merged group (use last outage's cause)
+                    group_cause = 'unknown'
+                    for s in reversed(outages):
+                        if s.get('cause') and s['cause'] != 'unknown':
+                            group_cause = s['cause']
+                            break
+
+                    incidents.append({
+                        'type': 'outage' if outages else 'slow_speed',
+                        'timestamp': subs[0]['timestamp'],
+                        'datetime': subs[0]['datetime'],
+                        'merged': True,
+                        'summary': summary,
+                        'resolved_at': g['resolved_at'],
+                        'sub_count': len(subs),
+                        'total_downtime_seconds': total_downtime,
+                        'cause': group_cause,
+                    })
+
+            incidents.sort(key=lambda x: x['timestamp'], reverse=True)
+
+            return jsonify({
+                'incidents': incidents,
+                'count': len(incidents),
+                'hours': hours,
+            })
+
         @self.app.route('/status', methods=['GET'])
         def status():
             """Get current status."""
@@ -906,6 +1229,31 @@ class VPSMonitor:
                 as_attachment=True,
                 download_name='speedtest.bin'
             )
+        @self.app.route('/trigger-speedtest', methods=['POST'])
+        def trigger_speedtest():
+            """Trigger a speed test on the NAS."""
+            import urllib.request
+            import urllib.error
+            nas_url = "http://100.66.41.139:8090"
+            test_type = request.args.get('type', 'ookla')  # ookla, vps, or full
+            
+            try:
+                if test_type == 'full':
+                    endpoint = f"{nas_url}/speedtest/full"
+                elif test_type == 'ookla':
+                    endpoint = f"{nas_url}/speedtest/ookla"
+                else:
+                    endpoint = f"{nas_url}/speedtest"
+                
+                req = urllib.request.Request(endpoint, method='GET')
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = resp.read()
+                    return Response(data, mimetype='application/json')
+            except urllib.error.URLError as e:
+                return jsonify({'error': f'Failed to reach NAS: {str(e)}'}), 502
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+
 
     def _check_loop(self):
         """Background loop to check for missed heartbeats."""
