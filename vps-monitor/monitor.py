@@ -559,7 +559,6 @@ class Config:
     database_file: str = './monitor.db'
     # Grace period after startup before sending DOWN notifications
     startup_grace_seconds: int = 120
-    vps_monitor_url: str = ''
 
     @classmethod
     def load(cls, config_path: str = 'config.yaml') -> 'Config':
@@ -585,7 +584,6 @@ class Config:
             'OUTAGE_LOG_FILE': ('outage_log_file', str),
             'STARTUP_GRACE': ('startup_grace_seconds', int),
             'DATABASE_FILE': ('database_file', str),
-            'VPS_MONITOR_URL': ('vps_monitor_url', str),
         }
 
         for env_var, (attr, converter) in env_mappings.items():
@@ -1217,8 +1215,7 @@ class VPSMonitor:
         @self.app.route('/dashboard', methods=['GET'])
         def dashboard():
             """Serve the dashboard HTML."""
-            html = DASHBOARD_HTML.replace('__VPS_MONITOR_URL__', self.config.vps_monitor_url)
-            return Response(html, mimetype='text/html')
+            return Response(DASHBOARD_HTML, mimetype='text/html')
 
         @self.app.route('/speedtest', methods=['GET'])
         def speedtest():
