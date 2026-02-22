@@ -41,3 +41,4 @@ data/
 DEPLOYMENT.md
 update-nas.sh
 docker-compose.override.yml
+memory/
