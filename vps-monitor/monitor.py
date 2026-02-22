@@ -212,7 +212,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 <body>
     <div class="container">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
-            <a href="__VPS_MONITOR_URL__" style="color:#64748b;text-decoration:none;font-size:0.9rem;">&larr; Back to VPS Monitor</a>
+            <a href=".." style="color:#64748b;text-decoration:none;font-size:0.9rem;">&larr; Back to VPS Monitor</a>
             <h1 style="margin:0;">
                 <span class="status-dot" id="statusDot"></span>
                 Internet Monitor
