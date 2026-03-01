@@ -295,7 +295,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
     <script>
         let speedChart, uploadChart, latencyChart;
         let selectedHours = 24;
-        const basePath = window.location.pathname.replace(/\/$/, '') || '';
+        const _path = window.location.pathname.replace(/\/$/, '');
+        const basePath = (_path === '' || _path === '/dashboard') ? '' : _path;
 
         const chartOptions = {
             responsive: true,
