@@ -129,6 +129,17 @@ The NAS also keeps its own daily CSVs in `/share/Container/nas-monitor/logs/` (l
 - Hostname for the Worker.
 - Whether to keep the NAS's `:8090` HTTP server once commands come through heartbeats.
 
+## Additions 2026-11-07 (from the servers session)
+
+Still true on 2026-11-07: nothing is monitoring. The PBX VPS was wiped on 2026-10-19 (its replacement is syd1), and `nas-monitor` is not running on the 453 (only `dupr` and `watchtower` are).
+
+1. **The home half runs on mini-au, not the 453.** The 453 is going to be wiped and rebuilt with Debian, and mini-au (2012 Mac mini, Debian 13, `ssh joseph@100.88.74.119`) is the home server box that's taking over the 453's server work. It is set up only through the servers repo (`~/Claude_Code/servers`): add a role `roles/internet-monitor` (a Podman Quadlet is normal on mini-au, or plain python3 under systemd), add it to `mini-au.yml`, and add a row to `hosts/mini-au.md` (ports, RAM, data, secrets). Read `~/Claude_Code/servers/CLAUDE.md` and `hosts/mini-au.md` first. Several sessions share that working copy: never run the full `mini-au.yml` on a dirty tree; run only this role (one-role scratch playbook). The "NAS changes" section above then applies to wherever `monitor.py` ends up; `PUSHOVER_*` never goes on the box, as planned.
+2. **Drop the `:8090` server** (settles the open decision): with commands coming in on heartbeats, nothing needs to reach the home box, so no port to open on mini-au.
+3. **Save the old home-side logs before the 453 rebuild:** `/share/Container/nas-monitor/logs` on the 453, 280 daily CSVs (2025-12-28 to 2026-10-11, 2.3 MB). Copy them to the repo's `data/` (gitignored) and fold them into the history import if they're worth having.
+4. **A second heartbeat source**, so a home box rebooting or dying isn't reported as an internet outage. Have ts-259 (or stereo-au) send a bare heartbeat too (a systemd timer with one `curl` every minute, same service token, `source` field set; also via a role in the servers repo). The DO then sends **DOWN** only when every home source is silent, and a quieter "mini-au silent, internet fine" (priority 0) when only one is. mini-au also reboots itself for updates, which on its own would fire a DOWN every time.
+5. **Mind the data use: the home line is Optus LTE** (behind CGNAT; see `servers/hosts/stereo-au.md`). An hourly 10 MB test is ~7 GB a month before slow-mode retests every 5 minutes. Ask Jo whether the plan has a cap; if in doubt, test every 3 hours or use a smaller file, and cap slow mode (e.g. at most 6 retests then hourly).
+6. **Pushover:** the servers repo already has a `pushover` role (box alerts from mini-au, ts-259 and others). Keep this project's own "Home Internet" app as planned so its alerts can be muted and counted separately; Jo creates it and pastes the token into the Worker secret.
+
 ## Note: monitoring has been off since 2026-10-11
 
 Found while planning this (2026-10-19): the `nas-monitor` container received a SIGTERM at 2026-10-11 11:27 UTC, exited cleanly (status 0), and was never restarted. The NAS rebooted about 2026-10-13, and `restart: unless-stopped` kept the container down because it had been stopped explicitly. The VPS has reported "down" since then, and no heartbeats or speed tests have been recorded. Restarting the container (and changing its restart policy) is independent of this plan.
